@@ -1,0 +1,13 @@
+name: "encainca"
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python==3.7.9
+  - h5py
+  - scipy
+  - pandas
+  - matplotlib
+  - pip
+  - pip:
+    - tensorflow==2.4.1
