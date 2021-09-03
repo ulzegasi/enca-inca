@@ -8,12 +8,14 @@ The repository contains all the code needed to reproduce the proposed models _ex
 
 ## Demo   
 The repository can be set up on a clean environment by creating a conda environment by  
+  
 ```bash 
 conda env create -f environment.yml
 conda activate encainca
 ```
 
 In order to train models ENCA and INCA for statistical model 1 and 2, one can use the provided scripts:
+  
 ```bash
 python train_ENCA_model1.py
 python train_INCA_model1.py
