@@ -9,7 +9,7 @@ The repository contains all the code needed to reproduce the proposed models _ex
 ## Demo   
 The repository can be set up on a clean environment by creating a conda environment by  
   
-```bash 
+```bash
 conda env create -f environment.yml
 conda activate encainca
 ```
