@@ -1,7 +1,7 @@
 # ENCA-INCA
-## Autoencoder-based Summary Statistics for Approximate Bayesian Computation  
+## Learning Summary Statistics for Bayesian Inference with Autoencoders 
 
-The code here implements the work proposed by Anonymous et al. "Autoencoder-based Summary Statistics for Approximate Bayesian Computation", 2021.
+The code here implements the [work](https://arxiv.org/abs/2201.12059) proposed by Albert, C., Ulzega, S., Ozdemir, F., Perez-Cruz, F. and Mira, A. (2022). Learning Summary Statistics for Bayesian Inference with Autoencoders. arXiv preprint arXiv:2201.12059.
 
 ## Contents 
 The repository contains all the code needed to reproduce the proposed models _explicit noise conditional autoencoder_ (ENCA) and _implicit noise conditional autoencoder_ (INCA) for encoding near-sufficient and highly concentrated summary statistics for the two statistical models experimented in this work. 
@@ -35,6 +35,11 @@ Please report any issues if you come across bugs.
 
 ## Citation  
 
-If you use any content of this repository, please refer to the following paper: 
-
-#TBD
+If you use any content of this repository, please use the following bibtex: 
+```
+@article{albert2022learning,
+  title={Learning Summary Statistics for Bayesian Inference with Autoencoders},
+  author={Albert, Carlo and Ulzega, Simone and Ozdemir, Firat and Perez-Cruz, Fernando and Mira, Antonietta},
+  journal={arXiv preprint arXiv:2201.12059},
+  year={2022}
+}
