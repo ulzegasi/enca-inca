@@ -1,4 +1,7 @@
 # ENCA-INCA
+
+[![launch - renku](https://img.shields.io/badge/launch-renku-2ea44f?logo=python)](https://renkulab.io/projects/bistom/enca-inca/sessions/new?autostart=1)
+
 ## Learning Summary Statistics for Bayesian Inference with Autoencoders 
 
 The code here implements the [work](https://arxiv.org/abs/2201.12059) proposed by Albert, C., Ulzega, S., Ozdemir, F., Perez-Cruz, F. and Mira, A. (2022). Learning Summary Statistics for Bayesian Inference with Autoencoders. arXiv preprint arXiv:2201.12059.
@@ -25,7 +28,7 @@ python train_INCA_model2.py
 
 ## Interactive Environment  
 
-The project can also be run on [renku environment](https://renkulab.io/projects/bistom/enca-inca). 
+The project can also be run on [renku environment](https://renkulab.io/projects/bistom/enca-inca/sessions/new?autostart=1). 
 This allows to skip the step requiring to set up an environment to test the repo. 
 
 ## Prerequisites   
@@ -43,3 +46,4 @@ If you use any content of this repository, please use the following bibtex:
   journal={arXiv preprint arXiv:2201.12059},
   year={2022}
 }
+```
