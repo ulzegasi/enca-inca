@@ -210,7 +210,7 @@ def main(args):
     c_lims = [4.2, 5.8]
     sigma_lims = [0.005, 0.025]
     #############################################
-    fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (np.exp(-x_old)) + sigma * epsilon
+    fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (1-x_old) + sigma * epsilon
     #############################################
     gen_train = src.generators.DataGenerator_NLAR1_Simplified_BatchSampler(len_timeseries=args.len_timeseries, batch_size=args.batch_size, x_0=x_0, c_lims=c_lims, sigma_lims=sigma_lims, fn=fn)
     dataset_train = tf.data.Dataset.from_generator(lambda: gen_train, output_types=(tf.float32, tf.float32, tf.float32))
@@ -544,7 +544,7 @@ class Sampler:
         c_lims = kwargs.pop('c_lims', [4.2, 5.8])
         sigma_lims = kwargs.pop('sigma_lims', [0.005, 0.025])
         #############################################
-        fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (np.exp(-x_old)) + sigma * epsilon
+        fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (1-x_old) + sigma * epsilon
         #############################################
         func = kwargs.pop('fn', fn)
         batch_size_requested = kwargs.pop('batch_size', None)

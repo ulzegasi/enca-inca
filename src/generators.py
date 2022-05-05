@@ -93,7 +93,7 @@ class DataGenerator_NLAR1_Simplified:
         if self.func is not None:
             self.fn = self.func
         else:
-            self.fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (np.exp(-x_old)) + sigma * epsilon
+            self.fn = lambda c, x_old, sigma, epsilon: c * x_old**2 * (1-x_old) + sigma * epsilon
         
     def draw_c(self):
         if not (isinstance(self.c_lims, tuple) or isinstance(self.c_lims, list)):
