@@ -1,14 +1,13 @@
-name: "base"
+name: encainca
 channels:
-  - defaults
   - conda-forge
 dependencies:
-  - h5py
+  - python=3.10
+  - numpy
   - scipy
   - pandas
   - matplotlib
+  - h5py
   - pip
   - pip:
-    - tensorflow==2.4.1
-prefix: "/opt/conda"
-  
+    - tensorflow>=2.14
