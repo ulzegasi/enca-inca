@@ -1,3 +1,15 @@
+"""
+src.sdde_solar_dynamo_julia provides a Python interface to the Julia SDDE solver:
+- load packages and defines Julia model functions
+- Julia functions are initialized when _init_julia() is called
+- _init_julia() will be called lazily inside sn() and summary_statistics() when they are first called.
+- _init_julia is governed by a global _INITIALIZED flag to ensure it only runs once.
+- sn() runs the SDDE solver and returns the time series of the magnetic field strength
+- summary_statistics() computes summary statistics from the time series using FFT
+- We do the Julia setup lazily, only when sn() or summary_statistics() is called
+- For stability, call julia_bootstrap.init_julia() at the very top of your main script
+"""
+  
 from __future__ import annotations
 
 from typing import Iterable, Optional, Sequence
@@ -8,7 +20,6 @@ from typing import Iterable, Optional, Sequence
 
 jl = None
 _INITIALIZED = False
-
 
 def _init_julia():
     """
@@ -22,7 +33,7 @@ def _init_julia():
     if _INITIALIZED:
         return
 
-    # Import Main lazily
+    # Import Main lazily (already bootstrapped in julia_bootstrap)
     if jl is None:
         from juliacall import Main as _jl
         jl = _jl
