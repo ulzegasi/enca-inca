@@ -1,4 +1,5 @@
 # Author: Firat Ozdemir, October 2019, firat.ozdemir@datascience.ch
+# Updated by: Simone Ulzega, March 2026, simone.ulzega@zhaw.ch
 
 import numpy as np
 import src.utils as utils
@@ -172,3 +173,210 @@ class DataGenerator_NLAR1_Simplified_BatchSampler(DataGenerator_NLAR1_Simplified
                 l_noise[i,...] = np.expand_dims(sample['epsilon_i'], -1)
             d = (l_observation, params, l_noise)
             yield d
+
+
+# --- Generators for the Julia SDDE solar dynamo model ---
+class DataGenerator_SolarDynamo_SDDE_ENCA:
+    """
+    Yields tuples (x, params, noise) for ENCA training.
+
+    Deterministic map:
+        x = M(theta, eps)
+    with eps ~ N(0,1) independent of theta.
+
+    - x:     [L, 1] float32
+    - params:[5]    float32  (tau, T, Nd, sigma, Bmax)
+    - noise: [L, C] float32  (Gaussian channels fed to decoder)
+
+    where L = Tobs/saveat (requires Tobs divisible by saveat).
+    """
+
+    def __init__(
+        self,
+        Tobs: int = 929,
+        saveat: float = 1.0,
+        num_noise_channels: int = 1,
+        *,
+        prng=None,
+        Twarmup: int = 200,
+        dt: float = 0.1,
+        tau_lims=(0.1, 10.0),
+        T_lims=(0.1, 10.0),
+        Nd_lims=(1.0, 15.0),
+        sigma_lims=(0.01, 0.3),
+        Bmax_lims=(1.0, 15.0),
+    ):
+        self.prng = prng if prng is not None else np.random.RandomState(seed=1822)
+
+        self.Tobs = int(Tobs)
+        self.saveat = float(saveat)
+        self.num_noise_channels = int(num_noise_channels)
+
+        self.Twarmup = int(Twarmup)
+        self.dt = float(dt)
+
+        self.tau_lims = tuple(tau_lims)
+        self.T_lims = tuple(T_lims)
+        self.Nd_lims = tuple(Nd_lims)
+        self.sigma_lims = tuple(sigma_lims)
+        self.Bmax_lims = tuple(Bmax_lims)
+
+        # enforce clean lengths (avoid silent off-by-one headaches)
+        ratio = self.Tobs / self.saveat
+        if abs(ratio - round(ratio)) > 1e-9:
+            raise ValueError(f"Tobs ({self.Tobs}) must be divisible by saveat ({self.saveat}).")
+        
+        # also require Twarmup divisible by saveat
+        ratio_w = self.Twarmup / self.saveat
+        if abs(ratio_w - round(ratio_w)) > 1e-9:
+            raise ValueError(f"Twarmup ({self.Twarmup}) must be divisible by saveat ({self.saveat}).")
+
+        self.L = int(round(ratio))  # output length after downsampling
+
+    def _sample_theta(self):
+        tau = float(self.prng.uniform(*self.tau_lims))
+
+        # --- Quantize T to multiples of dt ---
+        Tmin, Tmax = self.T_lims
+        dt = self.dt
+
+        lag_min = int(np.ceil(Tmin / dt))
+        lag_max = int(np.floor(Tmax / dt))
+        if lag_max < lag_min:
+            raise ValueError(f"T_lims={self.T_lims} incompatible with dt={dt}")
+
+        lag_steps = int(self.prng.randint(lag_min, lag_max + 1))
+        T = float(lag_steps * dt)
+
+        Nd = float(self.prng.uniform(*self.Nd_lims))
+        sigma = float(self.prng.uniform(*self.sigma_lims))
+        Bmax = float(self.prng.uniform(*self.Bmax_lims))
+        return (tau, T, Nd, sigma, Bmax)
+
+    def __iter__(self):
+        # lazy import (safe wrt Julia/TF init ordering)
+        from src.sdde_solar_dynamo_julia import sn_from_noise
+
+        # EM increments: one eps per dt-step over [0, Tsim]
+        Tsim = self.Twarmup + self.Tobs
+        N_increments = int(round(Tsim / self.dt))
+        if abs(N_increments * self.dt - Tsim) > 1e-9:
+            raise ValueError(
+                f"Tsim ({Tsim}) must be divisible by dt ({self.dt}). "
+                f"Got N_increments*dt = {N_increments*self.dt}."
+            )
+
+        while True:
+            theta = self._sample_theta()
+
+            # bare noise for the Wiener increments (theta-independent)
+            eps_dt = self.prng.normal(0.0, 1.0, size=(N_increments,)).astype(np.float32)
+
+            # generate observation (already downsampled by saveat inside Julia path)
+            y = sn_from_noise(
+                theta,
+                eps_dt,
+                Twarmup=self.Twarmup,
+                Tobs=self.Tobs,
+                dt=self.dt,
+                saveat=self.saveat,
+            )
+            y = np.asarray(y, dtype=np.float32)          # [L]
+            x = y.reshape(-1, 1)                         # [L, 1]
+
+            params = np.asarray(theta, dtype=np.float32) # [5]
+
+            # decoder noise: match x length L
+            if self.num_noise_channels == 1:
+                noise = self.prng.normal(0.0, 1.0, size=(self.L, 1)).astype(np.float32)
+            else:
+                noise = self.prng.normal(0.0, 1.0, size=(self.L, self.num_noise_channels)).astype(np.float32)
+
+            yield (x, params, noise)
+            
+
+class DataGenerator_SolarDynamo_SDDE_INCA:
+    """
+    Yields (Xrep, params) for INCA:
+
+      Xrep:  (Nrep, L, 1) float32   replicas for same theta
+      params:(5,) float32           (tau, T, Nd, sigma, Bmax)
+
+    No explicit noise output.
+    """
+    def __init__(
+        self,
+        Tobs: int = 929,
+        saveat: float = 1.0,
+        *,
+        prng=None,
+        Twarmup: int = 200,
+        dt: float = 0.1,
+        nrep: int = 8,
+        tau_lims=(0.1, 10.0),
+        T_lims=(0.1, 10.0),
+        Nd_lims=(1.0, 15.0),
+        sigma_lims=(0.01, 0.3),
+        Bmax_lims=(1.0, 15.0),
+    ):
+        self.prng = prng if prng is not None else np.random.RandomState(1822)
+
+        self.Tobs = int(Tobs)
+        self.saveat = float(saveat)
+        self.Twarmup = int(Twarmup)
+        self.dt = float(dt)
+        self.nrep = int(nrep)
+
+        self.tau_lims = tuple(tau_lims)
+        self.T_lims = tuple(T_lims)
+        self.Nd_lims = tuple(Nd_lims)
+        self.sigma_lims = tuple(sigma_lims)
+        self.Bmax_lims = tuple(Bmax_lims)
+        
+        if abs(self.saveat - 1.0) > 1e-12:
+            raise ValueError("This INCA generator currently assumes saveat == 1.0 (matches Julia sn()).")
+
+        ratio = self.Tobs / self.saveat
+        if abs(ratio - round(ratio)) > 1e-9:
+            raise ValueError(f"Tobs ({self.Tobs}) must be divisible by saveat ({self.saveat}).")
+        self.L = int(round(ratio))
+
+    def _sample_theta(self):
+        tau = float(self.prng.uniform(*self.tau_lims))
+
+        # quantize T to dt-grid (same rationale as ENCA generator)
+        Tmin, Tmax = self.T_lims
+        dt = self.dt
+        lag_min = int(np.ceil(Tmin / dt))
+        lag_max = int(np.floor(Tmax / dt))
+        if lag_max < lag_min:
+            raise ValueError(f"T_lims={self.T_lims} incompatible with dt={dt}")
+        lag_steps = int(self.prng.randint(lag_min, lag_max + 1))
+        T = float(lag_steps * dt)
+
+        Nd = float(self.prng.uniform(*self.Nd_lims))
+        sigma = float(self.prng.uniform(*self.sigma_lims))
+        Bmax = float(self.prng.uniform(*self.Bmax_lims))
+        return (tau, T, Nd, sigma, Bmax)
+
+    def __iter__(self):
+        from src.sdde_solar_dynamo_julia import sn_nrep  # lazy import for Julia/TF safety
+
+        while True:
+            theta = self._sample_theta()
+            params = np.asarray(theta, dtype=np.float32)  # (5,)
+
+            seeds = self.prng.randint(1, 2**31 - 1, size=(self.nrep,)).tolist()  # plain Python ints
+
+            Xrep = sn_nrep(
+                theta,
+                seeds,
+                Twarmup=self.Twarmup,
+                Tobs=self.Tobs,
+                dt=self.dt,
+                saveat=self.saveat,
+            )
+
+            Xrep = np.asarray(Xrep, dtype=np.float32)[..., None]   # (Nrep, L, 1)
+
+            yield (Xrep, params)

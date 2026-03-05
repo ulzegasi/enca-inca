@@ -3,8 +3,14 @@
 # This training pipeline has an encoder-decoder-like architecture. From input timeseries to sufficient statistics space, then
 # using the noise vectors back to the reconstruction of the initial input signal.
 
+# IMPORTANT: init_julia() must happen before importing tensorflow, 
+# otherwise there will be a conflict in the shared libraries used by both.
+from julia_bootstrap import init_julia
+init_julia()
+
 import tensorflow as tf
-assert tf.__version__[0] == '2' # this script is intended for tf v2.2+
+assert tf.__version__.startswith("2."), f"TensorFlow 2.x required, got {tf.__version__}"
+
 import os, glob
 import shutil
 import datetime
@@ -12,6 +18,9 @@ import numpy as np
 import sys
 import json
 import logging
+import time 
+
+# --- Configuring Python’s logging system ---
 root = logging.getLogger()
 root.setLevel(logging.DEBUG)
 handler = logging.StreamHandler(sys.stdout)
@@ -20,9 +29,12 @@ formatter = logging.Formatter('%(asctime)s %(message)s')
 handler.setFormatter(formatter)
 root.addHandler(handler)
 
+
+# --- Debugging switch for eager execution ---
 _DEBUG = False
 if _DEBUG:
     tf.config.run_functions_eagerly(True)
+
 # custom libs
 import src.generators
 import src.utils_tf
@@ -90,21 +102,75 @@ class Manage_Hyper_Parameters:
             self.args = Args_(args) # convert dictionary to a class with attributes (to match code similar with training)
         self.logdir = logdir
     def check_args_maybe_append(self, args):
+        """
+        Compare current args (ExpSetup) against the saved hyper_parameters.json.
+
+        - Treat list/tuple as equivalent (JSON turns tuples into lists).
+        - Treat numpy scalars as Python scalars.
+        - For floats, allow tiny numerical differences.
+        - If a real mismatch is found, raise (so training truly stops).
+        - If new keys are present, renew the JSON file.
+        """
         if self.args is None:
             return None
+
+        def _norm(v):
+            # JSON loads tuples as lists; treat them equivalently.
+            if isinstance(v, (list, tuple)):
+                return tuple(v)
+            # numpy scalars -> python scalars
+            try:
+                import numpy as _np
+                if isinstance(v, _np.generic):
+                    return v.item()
+            except Exception:
+                pass
+            return v
+
+        def _equal(a, b):
+            a = _norm(a)
+            b = _norm(b)
+
+            # float-ish comparisons with tolerance
+            if isinstance(a, float) or isinstance(b, float):
+                try:
+                    return abs(float(a) - float(b)) <= 1e-12
+                except Exception:
+                    return a == b
+
+            return a == b
+
         save_args = False
-        # for k in args:
+        mismatches = []
+
         for k in dir(args):
-            if k.startswith('__'):
+            if k.startswith("__"):
                 continue
+
             if not hasattr(self.args, k):
-                print('WARNING: key "%s" was missing in the new hyper-parameter configuration; will renew file.' % k)
+                print(f'WARNING: key "{k}" was missing in the saved hyper-parameter configuration; will renew file.')
                 save_args = True
-            else:
-                if getattr(self.args, k) != getattr(args, k):
-                    print('ERROR! Mismatch in hyper-parameter settings file. Parameter %s was %s, now it is %s. Quitting training.' % (k, getattr(self.args, k), getattr(args, k)))
+                continue
+
+            old_v = getattr(self.args, k)
+            new_v = getattr(args, k)
+
+            if not _equal(old_v, new_v):
+                mismatches.append((k, old_v, new_v))
+
         if save_args:
             self.save_parameters(args)
+
+        if mismatches:
+            # Print all mismatches, then stop.
+            for k, old_v, new_v in mismatches:
+                print(f'ERROR! Mismatch in hyper-parameter settings file. Parameter {k} was {old_v}, now it is {new_v}.')
+            raise RuntimeError(
+                f"Hyper-parameter mismatch detected ({len(mismatches)} keys). "
+                "Either restore the old settings or start a new logdir."
+            )
+
+        return None
     def save_parameters(self, args):
         d_args = {}
         for attr in dir(args):
@@ -141,19 +207,44 @@ class Manage_Hyper_Parameters:
 
 ##################################################################################################
 class ExpSetup:
-    '''Use this class to define the hyper parameters to be used for the AE.'''
     def __init__(self):
-        self.logdir = '/tmp/model2_ENCA'
-        self.ndims_latent = 3 # #summary stats
-        self.num_noise_channels = 2 # #different noise vectors
-        self.num_model_parameters = 3 # solarDynamo model has alpha1, delta and epsilon_max as model parameters.
-        self.len_timeseries = 200
-        self.batch_size = 300
-        self.max_training_steps = int(3*1e6) # maximum number of training steps unless optimization gets killed.
-        self.freq_log = 100 # frequency to update logged values in tensorboard.
+        tag = "test"   # change this when you test something new
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.logdir = os.path.join(
+            os.getcwd(),
+            "sdde_ENCA_runs",
+            f"{run_id}_{tag}"
+        )
 
+        self.ndims_latent = 10
+        self.num_noise_channels = 1
+        self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
+
+        # SDDE sim settings
+        self.Twarmup = 200
+        self.Tobs = 929
+        self.dt = 0.1
+        self.saveat = 1.0
+
+        # derived length used by NN + dataset shapes
+        ratio = self.Tobs / self.saveat
+        if abs(ratio - round(ratio)) > 1e-9:
+            raise ValueError(f"Tobs ({self.Tobs}) must be divisible by saveat ({self.saveat}).")
+        self.len_timeseries = int(round(ratio))  # equals Tobs if saveat=1.0
+
+        self.batch_size = 64
+        self.max_training_steps = int(3e6)
+        self.freq_log = 100
+        
+        # parameter priors
+        self.tau_lims = (0.1, 10.0)
+        self.T_lims = (0.1, 10.0)
+        self.Nd_lims = (1.0, 15.0)
+        self.sigma_lims = (0.01, 0.3)
+        self.Bmax_lims = (1.0, 15.0)
+        
 ##################################################################################################
-def main(args):
+def main():
 
     args = ExpSetup()
 
@@ -167,16 +258,41 @@ def main(args):
 
     ##################################################################################################
     # Define a generator function for observations, parameters, and noise vectors
-    p0 = 1.0
-    alpha1_lims = [0.9, 1.4]
-    delta_lims = [0.05, 0.25]
-    epsilon_lims = [0.02, 0.15]
-    ###############################################
-    gen_train = src.generators.DataGenerator_SolarDynamo_Simplified(len_timeseries=args.len_timeseries, p0=p0, alpha1_lims=alpha1_lims, delta_lims=delta_lims, epsilon_lims=epsilon_lims)
-    dataset_train = tf.data.Dataset.from_generator(lambda: gen_train, output_types=(tf.float32, tf.float32, tf.float32))
-    dataset_train = dataset_train.repeat(count=1)
-    dataset_train = dataset_train.batch(args.batch_size, drop_remainder=True)
-    dataset_train = dataset_train.prefetch(buffer_size=10) # #number of minibatches to pre-fetch.
+    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+        Tobs=args.Tobs,
+        saveat=args.saveat,
+        num_noise_channels=args.num_noise_channels,
+        Twarmup=args.Twarmup,
+        dt=args.dt,
+        # parameter priors
+        tau_lims=args.tau_lims,
+        T_lims=args.T_lims,
+        Nd_lims=args.Nd_lims,
+        sigma_lims=args.sigma_lims,
+        Bmax_lims=args.Bmax_lims,
+    )
+    
+    def next_batch_from_generator(gen, batch_size):
+        """Collect batch_size samples from the Python generator (main thread)."""
+        xs = []
+        ps = []
+        ns = []
+        for _ in range(batch_size):
+            x0, p0, n0 = next(gen)   # gen yields numpy arrays
+            xs.append(x0)
+            ps.append(p0)
+            ns.append(n0)
+
+        # Stack into numpy batches
+        x_np = np.stack(xs, axis=0).astype(np.float32)      # (B, len, 1)
+        p_np = np.stack(ps, axis=0).astype(np.float32)      # (B, 5)
+        n_np = np.stack(ns, axis=0).astype(np.float32)      # (B, len, nc)
+
+        # Convert to TF tensors
+        x = tf.convert_to_tensor(x_np)
+        params = tf.convert_to_tensor(p_np)
+        noise = tf.convert_to_tensor(n_np)
+        return x, params, noise
 
     ##################################################################################################
     # Define the architecture
@@ -225,9 +341,16 @@ def main(args):
 
     ##################################################################################################
     # Define optimizer 
+    # --- Custom LR schedule: linear warmup from ~0 to your initial LR, then exponential decay ---
     # lr_schedule = src.utils_tf.LearningRateScheduleExponentialDecayWithLinearWarmup(steps_warmup=args.linear_warmup_steps, initial_learning_rate=1.e-3, decay_steps=int(6*1e3), decay_rate=0.92, staircase=True)
+    # --- Exponential decay with fixed initial LR ---
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1.e-3, decay_steps=int(6*1e3), decay_rate=0.92, staircase=True)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule) #, clipnorm=1e5, clipvalue=1.) #clips |gradients| above clipvalue to prevent exploding., #clipnorm: preventative measure for divergence. Unfortunately both are clipping individually for each gradient, which can change the direction of the gradients..
+    # --- Optimizer --- 
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule) 
+    #, clipnorm=1e5, clipvalue=1.) 
+    # #clips |gradients| above clipvalue to prevent exploding., 
+    # #clipnorm: preventative measure for divergence. 
+    # Unfortunately both are clipping individually for each gradient, which can change the direction of the gradients..
     global_gradient_clipnorm = 1e5
 
     ##################################################################################################
@@ -255,51 +378,46 @@ def main(args):
     # Setup summaries for tensorboard
     summary_writer = tf.summary.create_file_writer(logdir=os.path.join(args.logdir, 'train'))
     
-    @tf.function
     def export_summary_scalars(dict_name_and_val, step, writer):
-        '''dict_name_and_val = {'name1': value1, 'name2': value2, ...}'''
         if not isinstance(dict_name_and_val, dict):
             raise AssertionError('dict_name_and_val must be a dictionary.')
         with writer.as_default():
-            for k in dict_name_and_val.keys():
-                tf.summary.scalar(k, dict_name_and_val[k], step=step)
+            for k, v in dict_name_and_val.items():
+                tf.summary.scalar(k, v, step=step)
 
-    @tf.function
     def export_summary_histograms(dict_name_and_val, step, writer):
         if not isinstance(dict_name_and_val, dict):
             raise AssertionError('dict_name_and_val must be a dictionary.')
         with writer.as_default():
-            for k in dict_name_and_val.keys():
-                tf.summary.histogram(k, dict_name_and_val[k], step=step)
+            for k, v in dict_name_and_val.items():
+                tf.summary.histogram(k, v, step=step)
 
     ##################################################################################################
     # wrap a training step for performance gains.
     @tf.function
     def train_step(model, x, params, noise, optimizer):
-        '''Single training step.'''
-        with tf.GradientTape(persistent=False) as tape: #persistent=True if .gradient() will be called multiple times (e.g., multiple losses)
+        """Single training step (no logging inside)."""
+        with tf.GradientTape(persistent=False) as tape:
             z_latent = model.encoder(x, training=True)
             x_reconst = model.decoder((z_latent, noise), training=True)
-            dict_reconstruction_mse = loss_reconstruction_fn(x, x_reconst, return_each_dim=True)
-            loss_reconstruction = tf.math.reduce_sum(list(dict_reconstruction_mse.values()))
-            dict_regress_params_mse = loss_regress_params_fn(params, z_latent, return_each_dim=True)
-            loss_regress_params = tf.math.reduce_sum(list(dict_regress_params_mse.values()))
-            loss = loss_reconstruction + loss_regress_params
-            trainable_variables = model.encoder.trainable_variables + model.decoder.trainable_variables
-            gradients = tape.gradient(loss, trainable_variables)
-            if global_gradient_clipnorm is not None:
-                gradients, global_norm = tf.clip_by_global_norm(gradients, clip_norm=global_gradient_clipnorm, name='clip_gradients_by_global_norm')
-            if tf.equal(optimizer.iterations % args.freq_log, 0):
-                l_avg_grads= [tf.math.reduce_mean(g) for g in gradients]
-                l_absmax_grads= [tf.math.reduce_max(tf.math.abs(g)) for g in gradients]
-                l_gradmean_names = ['gradient_mean_'+v.name for v in trainable_variables]
-                l_gradabsmax_names = ['gradient_absmax_'+v.name for v in trainable_variables]
-                # export avg and absolute max gradients of variables to tensorboard
-                d_grads = {**dict(zip(l_gradmean_names, l_avg_grads)), **dict(zip(l_gradabsmax_names, l_absmax_grads))}
-                export_summary_scalars(dict_name_and_val=d_grads, step=optimizer.iterations, writer=summary_writer)
-            optimizer.apply_gradients(zip(gradients, trainable_variables))
-        return (loss_reconstruction, loss_regress_params), (z_latent, x_reconst), (dict_reconstruction_mse, dict_regress_params_mse)
 
+            dict_reconstruction = loss_reconstruction_fn(x, x_reconst, return_each_dim=True)
+            loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
+
+            dict_regression = loss_regress_params_fn(params, z_latent, return_each_dim=True)
+            loss_regress_params = tf.reduce_sum(list(dict_regression.values()))
+
+            loss = loss_reconstruction + loss_regress_params
+
+        trainable_variables = model.encoder.trainable_variables + model.decoder.trainable_variables
+        gradients = tape.gradient(loss, trainable_variables)
+
+        if global_gradient_clipnorm is not None:
+            gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=global_gradient_clipnorm)
+
+        optimizer.apply_gradients(zip(gradients, trainable_variables))
+
+        return (loss_reconstruction, loss_regress_params), (z_latent, x_reconst), (dict_reconstruction, dict_regression)
     ##################################################################################################
     # Define a few metrics to export to tensorboard
     avg_loss_total = tf.keras.metrics.Mean(name='loss_total', dtype=tf.float32) # variable will keep track of average of loss value since last freq_log
@@ -317,84 +435,207 @@ def main(args):
 
     ##################################################################################################
     # Execute training loop
-    for x, params, noise in dataset_train:
-        num_step = optimizer.iterations
-        if num_step >= args.max_training_steps:
-            logging.info('Training is completed.')
-            break
-        loss_tuple, z_and_x, dict_mse = train_step(model=model_obj, x=x, params=params, noise=noise, optimizer=optimizer)
+    step = 0  # will survive after loop
+    
+    gen_iter = iter(gen_train)
+    
+    print("Building first batch...")
+    t0 = time.time()
+    x, params, noise = next_batch_from_generator(gen_iter, args.batch_size)
+    print(f"First batch built in {time.time()-t0:.1f}s: x={x.shape}, params={params.shape}, noise={noise.shape}")
+
+    # --- quick finiteness + stats checks (on first batch) ---
+    def assert_finite(name, t):
+        t_np = t.numpy()
+        if not np.isfinite(t_np).all():
+            bad = np.where(~np.isfinite(t_np))
+            raise ValueError(f"{name} has non-finite values at {bad[:3]}")
+
+    assert_finite("x", x)
+    assert_finite("params", params)
+    assert_finite("noise", noise)
+    print("Batch finiteness: OK")
+
+    print("x stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
+    print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
+    print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+
+    # --- warm up tf.function tracing/compilation ---
+    print("Warming up train_step (tf.function tracing/compilation)...")
+    t1 = time.time()
+    _ = train_step(model=model_obj, x=x, params=params, noise=noise, optimizer=optimizer)
+    print(f"Warmup train_step done in {time.time()-t1:.2f}s")
+
+    # ---------------------------------------------------------
+    # Main training loop
+    # ---------------------------------------------------------
+    while True:
+        # 1) build batch (python)
+        x, params, noise = next_batch_from_generator(gen_iter, args.batch_size)
+
+        # 2) train step (tf.function)
+        loss_tuple, z_and_x, dict_mse = train_step(
+            model=model_obj, x=x, params=params, noise=noise, optimizer=optimizer
+        )
+
+        # unpack
         z_latent, x_reconst = z_and_x
         loss_reconstruction, loss_regress_params = loss_tuple
         loss_total = loss_reconstruction + loss_regress_params
         dict_rec, dict_reg = dict_mse
-        # Update loggers for tensorboard
+
+        # 3) NaN/Inf guard
+        tf.debugging.assert_all_finite(loss_total, "loss_total has NaN or Inf")
+
+        # 4) step / stopping
+        step = int(optimizer.iterations.numpy())
+        if step >= args.max_training_steps:
+            logging.info("Training is completed.")
+            break
+
+        # 5) metrics + logging + checkpoints
+
+        # Update metrics (your existing code continues...)
         avg_loss_recon.update_state(loss_reconstruction)
         avg_loss_reg_p.update_state(loss_regress_params)
-        avg_loss_total.update_state(loss_total) # aggregate values since last flush
+        avg_loss_total.update_state(loss_total)
         avg_loss_long_term.update_state(loss_total)
-        # A little patchy way to keep track of each reconstructed signal and noise channel
+
+        # Per-channel reconstruction losses
         for k in dict_rec:
             if k not in dict_avg_loss_recon_items:
                 dict_avg_loss_recon_items[k] = tf.keras.metrics.Mean(name=k, dtype=tf.float32)
-            dict_avg_loss_recon_items[k].update_state(dict_rec[k])                
+            dict_avg_loss_recon_items[k].update_state(dict_rec[k])
+
+        # Per-parameter regression losses
         for k in dict_reg:
             if k not in dict_avg_loss_reg_p_items:
                 dict_avg_loss_reg_p_items[k] = tf.keras.metrics.Mean(name=k, dtype=tf.float32)
             dict_avg_loss_reg_p_items[k].update_state(dict_reg[k])
-        
-         # Record RMSE for reconstruction and regressed parameters regardless of the loss
+
+        # RMSE reconstruction
         for i_ in range(x.shape[-1]):
-            k = 'RMSE_x_ch_%d'%(i_+1)
+            k = f'RMSE_x_ch_{i_+1}'
             if k not in dict_avg_rmse_recon_items:
-                dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(name='rmse_reconstruction', dtype=tf.float32)
-            dict_avg_rmse_recon_items[k].update_state(y_true=x[...,i_], y_pred=x_reconst[...,i_])
+                dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                    name='rmse_reconstruction', dtype=tf.float32
+                )
+            dict_avg_rmse_recon_items[k].update_state(
+                y_true=x[..., i_], y_pred=x_reconst[..., i_]
+            )
+
+        # RMSE regression
         for i_ in range(params.shape[-1]):
-            k = 'RMSE_z_ch_%d'%(i_+1)
+            k = f'RMSE_z_ch_{i_+1}'
             if k not in dict_avg_rmse_reg_p_items:
-                dict_avg_rmse_reg_p_items[k] = tf.keras.metrics.RootMeanSquaredError(name='rmse_regularization', dtype=tf.float32)
-            dict_avg_rmse_reg_p_items[k].update_state(y_true=params[...,i_], y_pred=z_latent[...,i_])
-        # Export status to tensorboard
-        if tf.equal(optimizer.iterations % args.freq_log, 0):
-            d_scalars = {'loss_total': avg_loss_total.result(), 'loss_reconstruction': avg_loss_recon.result(), 'loss_regress_params': avg_loss_reg_p.result()}
+                dict_avg_rmse_reg_p_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                    name='rmse_regularization', dtype=tf.float32
+                )
+            dict_avg_rmse_reg_p_items[k].update_state(
+                y_true=params[..., i_], y_pred=z_latent[..., i_]
+            )
+
+        # ------------------------------------------------
+        # Logging block
+        # ------------------------------------------------
+        if step % args.freq_log == 0:
+
+            d_scalars = {
+                'loss_total': avg_loss_total.result(),
+                'loss_reconstruction': avg_loss_recon.result(),
+                'loss_regress_params': avg_loss_reg_p.result(),
+            }
+
+            # --- Parameter ranges in current batch ---
+            # (safe even with batch_size=1; then min==max)
+            p = params.numpy()   # shape (B, 5)
+
+            tau_min, tau_max     = float(p[:,0].min()), float(p[:,0].max())
+            T_min, T_max         = float(p[:,1].min()), float(p[:,1].max())
+            Nd_min, Nd_max       = float(p[:,2].min()), float(p[:,2].max())
+            sigma_min, sigma_max = float(p[:,3].min()), float(p[:,3].max())
+            Bmax_min, Bmax_max   = float(p[:,4].min()), float(p[:,4].max())
+
+            logging.info(
+                "params ranges: "
+                f"tau[{tau_min:.3f},{tau_max:.3f}] "
+                f"T[{T_min:.3f},{T_max:.3f}] "
+                f"Nd[{Nd_min:.3f},{Nd_max:.3f}] "
+                f"sigma[{sigma_min:.3f},{sigma_max:.3f}] "
+                f"Bmax[{Bmax_min:.3f},{Bmax_max:.3f}]"
+            )
+
+            # Optional: also push ranges to TensorBoard
+            d_scalars.update({
+                "theta/tau_min": tau_min, "theta/tau_max": tau_max,
+                "theta/T_min": T_min, "theta/T_max": T_max,
+                "theta/Nd_min": Nd_min, "theta/Nd_max": Nd_max,
+                "theta/sigma_min": sigma_min, "theta/sigma_max": sigma_max,
+                "theta/Bmax_min": Bmax_min, "theta/Bmax_max": Bmax_max,
+            })
+
             for k in dict_avg_loss_recon_items:
                 d_scalars[k] = dict_avg_loss_recon_items[k].result()
-                dict_avg_loss_recon_items[k].reset_states()
+                dict_avg_loss_recon_items[k].reset_state()
+
             for k in dict_avg_loss_reg_p_items:
                 d_scalars[k] = dict_avg_loss_reg_p_items[k].result()
-                dict_avg_loss_reg_p_items[k].reset_states()
+                dict_avg_loss_reg_p_items[k].reset_state()
+
             for k in dict_avg_rmse_recon_items:
                 d_scalars[k] = dict_avg_rmse_recon_items[k].result()
-                dict_avg_rmse_recon_items[k].reset_states()
+                dict_avg_rmse_recon_items[k].reset_state()
+
             for k in dict_avg_rmse_reg_p_items:
                 d_scalars[k] = dict_avg_rmse_reg_p_items[k].result()
-                dict_avg_rmse_reg_p_items[k].reset_states()
-            d_scalars['lr_schedule'] = lr_schedule(step=num_step)
-            export_summary_scalars(dict_name_and_val=d_scalars, step=optimizer.iterations, writer=summary_writer)
-            # Print current loss status to terminal
-            logging.info('Step %d: avg loss: %.3f, reconstruction loss: %.3f, parameter regression loss: %.3f.' % \
-                    (num_step, d_scalars['loss_total'], d_scalars['loss_reconstruction'], d_scalars['loss_regress_params']))
-            avg_loss_total.reset_states() #reset kept history of loss
-            avg_loss_recon.reset_states()
-            avg_loss_reg_p.reset_states()
-            # Export trainable variables to tboard histogram
-            # TODO: consider speeding this up.
-            l_enc = list(zip(*[['enc_'+v.name, v.value()] for v in model_obj.encoder.trainable_variables]))
-            l_dec = list(zip(*[['dec_'+v.name, v.value()] for v in model_obj.decoder.trainable_variables]))
-            d_histograms = {**dict(zip(l_enc[0], l_enc[1])), **dict(zip(l_dec[0], l_dec[1]))}
-            export_summary_histograms(dict_name_and_val=d_histograms, step=optimizer.iterations, writer=summary_writer)
-            # Save the current state of the model weights on disk.
-            save(save_manager, ckpt_number=optimizer.iterations)
-        # Check loss for long term best reconstruction
-        if tf.equal(optimizer.iterations % (10 * args.freq_log), 0):
-            if avg_loss_long_term.result() < curr_best_loss:
-                curr_best_loss = avg_loss_long_term.result()
-                avg_loss_long_term.reset_states()
-                logging.info('New long term best loss found: %.3f. Saving.' % curr_best_loss)
-                save(save_manager_best, ckpt_number=optimizer.iterations)
-            
-    ##################################################################################################
-    # Save model once again on the exit
-    save(save_manager, ckpt_number=optimizer.iterations)
+                dict_avg_rmse_reg_p_items[k].reset_state()
+
+            d_scalars['lr_schedule'] = lr_schedule(step=step)
+
+            export_summary_scalars(d_scalars, step=step, writer=summary_writer)
+
+            logging.info(
+                'Step %d: avg loss: %.3f, reconstruction loss: %.3f, parameter regression loss: %.3f.'
+                % (step,
+                float(d_scalars['loss_total']),
+                float(d_scalars['loss_reconstruction']),
+                float(d_scalars['loss_regress_params']))
+            )
+
+            avg_loss_total.reset_state()
+            avg_loss_recon.reset_state()
+            avg_loss_reg_p.reset_state()
+
+            d_histograms = dict(
+                [(f"enc_{v.name}", tf.identity(v)) for v in model_obj.encoder.trainable_variables] +
+                [(f"dec_{v.name}", tf.identity(v)) for v in model_obj.decoder.trainable_variables]
+            )
+            export_summary_histograms(d_histograms, step=step, writer=summary_writer)
+
+            save(save_manager, ckpt_number=step)
+
+        # ------------------------------------------------
+        # Long-term best model check
+        # ------------------------------------------------
+        if step % (10 * args.freq_log) == 0:
+
+            current_long_loss = float(avg_loss_long_term.result().numpy())
+
+            if current_long_loss < curr_best_loss:
+                curr_best_loss = current_long_loss
+                avg_loss_long_term.reset_state()
+
+                logging.info(
+                    'New long term best loss found: %.3f. Saving.' % curr_best_loss
+                )
+
+                save(save_manager_best, ckpt_number=step)
+
+
+    # ------------------------------------------------
+    # Final save after exiting loop
+    # ------------------------------------------------
+    save(save_manager, ckpt_number=step)
 
 class Sampler:
     '''Class provides user friendly access to low-dimensional space for summary statistics analysis.'''
@@ -494,20 +735,27 @@ class Sampler:
             raise AssertionError('Model weights with basename %s not found in logdir %s. Quitting.' % (basename, self.args.logdir))
         print('Model weights loaded from %s.' % ckptname)
 
-    def build_custom_generator(self, return_generator=False, **kwargs):
-        '''See inside DataGenerator_SolarDynamo_Simplified for the parameters one can modify for custom generator.'''
-        if 'prng' in kwargs:
-            prng = kwargs.pop('prng')
-        else:
+    def build_custom_generator(self, return_generator=False, *, prng=None):
+        if prng is None:
             prng = self.prng
-        p0 = kwargs.pop('p0', 1.0)
-        alpha1_lims = kwargs.pop('alpha1_lims', [0.9, 1.4])
-        delta_lims = kwargs.pop('delta_lims', [0.05, 0.25])
-        epsilon_lims = kwargs.pop('epsilon_lims', [0.02, 0.15])
-        generator = src.generators.DataGenerator_SolarDynamo_Simplified(len_timeseries=self.args.len_timeseries, prng=prng, p0=p0, alpha1_lims=alpha1_lims, delta_lims=delta_lims, epsilon_lims=epsilon_lims, **kwargs)
+
+        generator = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+            prng=prng,
+            Tobs=self.args.Tobs,
+            saveat=self.args.saveat,
+            num_noise_channels=self.args.num_noise_channels,
+            Twarmup=self.args.Twarmup,
+            dt=self.args.dt,
+            tau_lims=self.args.tau_lims,
+            T_lims=self.args.T_lims,
+            Nd_lims=self.args.Nd_lims,
+            sigma_lims=self.args.sigma_lims,
+            Bmax_lims=self.args.Bmax_lims,
+        )
+
         iterator = generator.__iter__()
         if return_generator:
-            return generator, iterator  
+            return generator, iterator
         else:
             self.generator = generator
             self.iterator = iterator
@@ -522,7 +770,7 @@ def get_ckptname(logdir, id):
     return fname
 
 if __name__ == "__main__":
-    gpus = tf.config.list_physical_devices('GPU')
-    # tf.config.set_visible_devices([], 'GPU') # do not use any GPU
-    # tf.config.set_visible_devices(gpus[0], 'GPU') ## Use only GPU: 0
-    main(0)
+    gpus = tf.config.list_physical_devices("GPU")
+    print("GPUs visible to TensorFlow:", gpus)
+    main()
+    

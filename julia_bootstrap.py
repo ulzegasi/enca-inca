@@ -5,7 +5,15 @@ before TensorFlow or other heavy native libraries are imported,
 thereby preventing low-level runtime conflicts 
 while keeping the SDDE solver embedded and fast.
 """
+_INITIALIZED = False
+
 def init_julia():
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
+
     from juliacall import Main as jl
-    jl.seval("VERSION")  # force init
+    version = jl.seval("VERSION")
+    print(f"--- Julia engine: ON (Julia {version}) ---")
+    _INITIALIZED = True
     return jl
