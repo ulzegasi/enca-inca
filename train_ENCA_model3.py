@@ -13,6 +13,13 @@ init_julia()
 
 import tensorflow as tf
 assert tf.__version__.startswith("2."), f"TensorFlow 2.x required, got {tf.__version__}"
+tf.get_logger().setLevel("ERROR")
+try:
+    from absl import logging as absl_logging
+    absl_logging.set_verbosity(absl_logging.ERROR)
+    absl_logging.set_stderrthreshold("error")
+except Exception:
+    pass
 
 import glob
 import shutil
