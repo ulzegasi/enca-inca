@@ -41,6 +41,18 @@ python train_ENCA_model3.py
 python train_INCA_model3.py
 ```
 
+Before launching one of these training scripts, manually review the `ExpSetup` class in [train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) and set the key run parameters there. In particular:
+
+```python
+self.ndims_latent = 10
+
+self.Tobs = 271  # C14 dataset: 929, obsSN dataset: 271
+
+self.batch_size = 64
+self.max_training_steps = int(2500)  # full run example: int(3e6)
+self.freq_log = 100
+```
+
 ## Julia Requirement
 
 The SDDE training scripts (`train_ENCA_model3.py` and `train_INCA_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
