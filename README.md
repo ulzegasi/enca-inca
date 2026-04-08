@@ -65,11 +65,6 @@ On cluster systems, it can also be necessary to point Julia to a writable depot 
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
 ```
 
-## Interactive Environment  
-
-The project can also be run on [renku environment](https://renkulab.io/projects/bistom/enca-inca/sessions/new?autostart=1). 
-This allows skipping most of the local environment setup needed to test the repository.
-
 ## Prerequisites   
 
 The current checked-in environment uses:
