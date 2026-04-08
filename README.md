@@ -7,18 +7,26 @@
 The code here implements the [work](https://arxiv.org/abs/2201.12059) proposed by Albert, C., Ulzega, S., Ozdemir, F., Perez-Cruz, F. and Mira, A. (2022). Learning Summary Statistics for Bayesian Inference with Autoencoders. arXiv preprint arXiv:2201.12059.
 
 ## Contents 
-The repository contains all the code needed to reproduce the proposed models _explicit noise conditional autoencoder_ (ENCA) and _implicit noise conditional autoencoder_ (INCA) for encoding near-sufficient and highly concentrated summary statistics for the two statistical models experimented in this work. 
+The repository contains the code needed to train the proposed models _explicit noise conditional autoencoder_ (ENCA) and _implicit noise conditional autoencoder_ (INCA) for several simulator settings:
+
+- `train_ENCA_model1.py`, `train_INCA_model1.py`: original model 1 experiments
+- `train_ENCA_model2.py`, `train_INCA_model2.py`: original model 2 experiments
+- `train_ENCA_model3.py`, `train_INCA_model3.py`: solar-dynamo / SDDE experiments using the Julia-backed simulator
+
+Supporting code lives in `src/`, and local training outputs are written to `sdde_ENCA_runs/` when running the newer SDDE scripts.
 
 ## Demo   
-The repository can be set up on a clean environment by creating a conda environment by  
-  
+The repository can be set up on a clean environment by creating a conda environment:
+
 ```bash
 conda env create -f environment.yml
 conda activate encainca
 ```
 
-In order to train models ENCA and INCA for statistical model 1 and 2, one can use the provided scripts:
-  
+This environment currently targets Python 3.10 and TensorFlow 2.x (`tensorflow>=2.14` in `environment.yml`).
+
+For the original experiments, one can run:
+
 ```bash
 python train_ENCA_model1.py
 python train_INCA_model1.py
@@ -26,15 +34,33 @@ python train_ENCA_model2.py
 python train_INCA_model2.py
 ``` 
 
+For the solar-dynamo / SDDE experiments, use:
+
+```bash
+python train_ENCA_model3.py
+python train_INCA_model3.py
+```
+
+## Julia Requirement
+
+The SDDE training scripts (`train_ENCA_model3.py` and `train_INCA_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
+
+If you only need the original model 1 and model 2 experiments, the Julia dependency is not required.
+
 ## Interactive Environment  
 
 The project can also be run on [renku environment](https://renkulab.io/projects/bistom/enca-inca/sessions/new?autostart=1). 
-This allows to skip the step requiring to set up an environment to test the repo. 
+This allows skipping most of the local environment setup needed to test the repository.
 
 ## Prerequisites   
 
-Code is tested for Tensorflow v2.4.1. However preliminary experiments suggest it should also work on TF v2.2.  
-Please report any issues if you come across bugs.
+The current checked-in environment uses:
+
+- Python 3.10
+- TensorFlow 2.x (`tensorflow>=2.14`)
+- NumPy, SciPy, pandas, matplotlib, and h5py
+
+Please report any issues if you come across bugs or platform-specific dependency problems.
 
 ## Citation  
 
