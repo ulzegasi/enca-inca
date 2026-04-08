@@ -5,13 +5,16 @@
 
 # IMPORTANT: init_julia() must happen before importing tensorflow, 
 # otherwise there will be a conflict in the shared libraries used by both.
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 from julia_bootstrap import init_julia
 init_julia()
 
 import tensorflow as tf
 assert tf.__version__.startswith("2."), f"TensorFlow 2.x required, got {tf.__version__}"
 
-import os, glob
+import glob
 import shutil
 import datetime
 import numpy as np
@@ -208,7 +211,7 @@ class Manage_Hyper_Parameters:
 ##################################################################################################
 class ExpSetup:
     def __init__(self):
-        tag = "test"   # change this when you test something new
+        tag = "smoke"   # change this when you test something new
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.logdir = os.path.join(
             os.getcwd(),
@@ -222,7 +225,7 @@ class ExpSetup:
 
         # SDDE sim settings
         self.Twarmup = 200
-        self.Tobs = 929
+        self.Tobs = 271 # C14 dataset: 929, obsSN dataset: 271
         self.dt = 0.1
         self.saveat = 1.0
 
@@ -233,7 +236,7 @@ class ExpSetup:
         self.len_timeseries = int(round(ratio))  # equals Tobs if saveat=1.0
 
         self.batch_size = 64
-        self.max_training_steps = int(3e6)
+        self.max_training_steps = int(2500) # int(3e6)
         self.freq_log = 100
         
         # parameter priors
