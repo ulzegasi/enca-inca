@@ -59,6 +59,12 @@ The SDDE training scripts (`train_ENCA_model3.py` and `train_INCA_model3.py`) in
 
 If you only need the original model 1 and model 2 experiments, the Julia dependency is not required.
 
+On cluster systems, it can also be necessary to point Julia to a writable depot path before launching the training:
+
+```bash
+export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
+```
+
 ## Interactive Environment  
 
 The project can also be run on [renku environment](https://renkulab.io/projects/bistom/enca-inca/sessions/new?autostart=1). 

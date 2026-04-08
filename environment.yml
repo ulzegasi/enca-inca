@@ -10,4 +10,5 @@ dependencies:
   - h5py
   - pip
   - pip:
+    - juliacall
     - tensorflow>=2.14
