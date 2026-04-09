@@ -4,7 +4,7 @@
 
 ## Learning Summary Statistics for Bayesian Inference with Autoencoders 
 
-The code here implements the [work](https://arxiv.org/abs/2201.12059) proposed by Albert, C., Ulzega, S., Ozdemir, F., Perez-Cruz, F. and Mira, A. (2022). Learning Summary Statistics for Bayesian Inference with Autoencoders. arXiv preprint arXiv:2201.12059.
+The code here implements the published work by Carlo Albert, Simone Ulzega, Fernando Perez-Cruz, Firat Ozdemir, and Antonietta Mira: *Learning summary statistics for Bayesian inference with Autoencoders*, SciPost Phys. Core 5, 043 (2022).
 
 ## Contents 
 The repository contains the code needed to train the proposed models _explicit noise conditional autoencoder_ (ENCA) and _implicit noise conditional autoencoder_ (INCA) for several simulator settings:
@@ -81,8 +81,10 @@ If you use any content of this repository, please use the following bibtex:
 ```
 @article{albert2022learning,
   title={Learning Summary Statistics for Bayesian Inference with Autoencoders},
-  author={Albert, Carlo and Ulzega, Simone and Ozdemir, Firat and Perez-Cruz, Fernando and Mira, Antonietta},
-  journal={arXiv preprint arXiv:2201.12059},
+  author={Albert, Carlo and Ulzega, Simone and Perez-Cruz, Fernando and Ozdemir, Firat and Mira, Antonietta},
+  journal={SciPost Physics Core},
+  volume={5},
+  pages={043},
   year={2022}
 }
 ```
