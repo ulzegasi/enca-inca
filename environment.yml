@@ -11,4 +11,5 @@ dependencies:
   - pip
   - pip:
     - juliacall
+    - tensorboard
     - tensorflow>=2.14
