@@ -34,6 +34,8 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs
 
+# For the first launch, keep the automatic date stamp.
+# For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
 export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_1
 mkdir -p "$ENCA_LOGDIR"
@@ -63,4 +65,3 @@ python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_
 # Run
 # ==============================
 srun --export=ALL,ENCA_LOGDIR="$ENCA_LOGDIR" --cpu-bind=cores python train_ENCA_model3.py
-
