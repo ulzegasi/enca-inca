@@ -34,7 +34,8 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs
 
-export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/enca_z10_1
+RUNSTAMP=$(date +%Y%m%d)
+export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_1
 mkdir -p "$ENCA_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -62,5 +63,4 @@ python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_
 # Run
 # ==============================
 srun --export=ALL,ENCA_LOGDIR="$ENCA_LOGDIR" --cpu-bind=cores python train_ENCA_model3.py
-
 
