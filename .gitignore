@@ -1,5 +1,8 @@
 
 sdde_ENCA_runs/
+txtout/
+Slurm-*/
+julia_env/.CondaPkg/
 # Created by https://www.gitignore.io/api/macos,python,R,linux,vim,emacs,visualstudiocode,intellij
 # Edit at https://www.gitignore.io/?templates=macos,python,R,linux,vim,emacs,visualstudiocode,intellij
 
