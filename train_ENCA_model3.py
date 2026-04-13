@@ -220,11 +220,12 @@ class ExpSetup:
     def __init__(self):
         tag = "smoke"   # change this when you test something new
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.logdir = os.path.join(
+        default_logdir = os.path.join(
             os.getcwd(),
             "sdde_ENCA_runs",
             f"{run_id}_{tag}"
         )
+        self.logdir = os.environ.get("ENCA_LOGDIR", default_logdir)
 
         self.ndims_latent = 10
         self.num_noise_channels = 1
