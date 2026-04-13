@@ -54,11 +54,13 @@ echo "Julia depot: $JULIA_DEPOT_PATH"
 echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "ENCA_LOGDIR=$ENCA_LOGDIR"
 nvidia-smi || true
 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 
 # ==============================
 # Run
 # ==============================
-srun --cpu-bind=cores python train_ENCA_model3.py
+srun --export=ALL,ENCA_LOGDIR="$ENCA_LOGDIR" --cpu-bind=cores python train_ENCA_model3.py
+
 
