@@ -40,7 +40,8 @@ RUNSTAMP=$(date +%Y%m%d)
 export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_1
 mkdir -p "$ENCA_LOGDIR"
 
-export TF_CPP_MIN_LOG_LEVEL=2
+export TF_CPP_MIN_LOG_LEVEL=3
+export TF_ENABLE_ONEDNN_OPTS=0
 
 export MPLCONFIGDIR=/cfs/earth/scratch/ulzg/.cache/matplotlib
 mkdir -p "$MPLCONFIGDIR"
@@ -59,7 +60,6 @@ julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "ENCA_LOGDIR=$ENCA_LOGDIR"
 nvidia-smi || true
-python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 
 # ==============================
 # Run
