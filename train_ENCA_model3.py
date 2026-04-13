@@ -242,8 +242,8 @@ class ExpSetup:
             raise ValueError(f"Tobs ({self.Tobs}) must be divisible by saveat ({self.saveat}).")
         self.len_timeseries = int(round(ratio))  # equals Tobs if saveat=1.0
 
-        self.batch_size = 64
-        self.max_training_steps = int(2500) # int(3e6)
+        self.batch_size = 300
+        self.max_training_steps = int(2e6) # int(3000) # int(3e6)
         self.freq_log = 100
         
         # parameter priors
