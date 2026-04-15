@@ -245,7 +245,7 @@ class ExpSetup:
 
         self.batch_size = 300
         self.max_training_steps = int(2e6) # int(3000) # int(3e6)
-        self.freq_log = 100
+        self.freq_log = 500
         
         # parameter priors
         self.tau_lims = (0.1, 10.0)

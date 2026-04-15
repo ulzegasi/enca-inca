@@ -130,9 +130,9 @@ def build_encoder_decoder(len_timeseries: int, ndims_latent: int, num_noise_chan
     return encoder, decoder
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, prior_lims):
     """
-    Simple per-parameter diagnostics: RMSE, corr.
+    Simple per-parameter diagnostics: RMSE, corr, normalized RMSE to prior width.
     y_true/y_pred: shape (N, 5)
     """
     out = {}
@@ -146,7 +146,11 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
         pc = p - p.mean()
         corr = float((tc @ pc) / (np.sqrt((tc @ tc) * (pc @ pc)) + eps))
 
-        out[name] = {"rmse": rmse, "corr": corr}
+        lo, hi = prior_lims[i]
+        width = float(hi - lo)
+        rmse_pct = float(100.0 * rmse / width) if width > 0 else float("nan")
+
+        out[name] = {"rmse": rmse, "corr": corr, "rmse_pct": rmse_pct}
     return out
 
 
@@ -156,7 +160,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--logdir", required=True, help="Run dir containing checkpoints + hyper_parameters.json")
-    ap.add_argument("--nsamples", type=int, default=512, help="How many synthetic samples to test")
+    ap.add_argument("--nsamples", type=int, default=1000, help="How many synthetic samples to test")
     ap.add_argument("--batch", type=int, default=64, help="Batch size for encoder forward pass")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--outdir", default=None, help="Where to save plots (default: <run>/diagnostics)")
@@ -230,7 +234,7 @@ def main():
     # -------------------------
     # Build generator (must match training)
     # -------------------------
-    gen = src.generators.DataGenerator_SolarDynamo_SDDE(
+    gen = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
         prng=prng,
         Tobs=Tobs,
         saveat=saveat,
@@ -263,12 +267,18 @@ def main():
     # Core diagonal-test assumption:
     Ppred = Z[:, :5]
 
-    metrics = compute_metrics(Ptrue, Ppred)
+    prior_lims = [tau_lims, T_lims, Nd_lims, sigma_lims, Bmax_lims]
+    metrics = compute_metrics(Ptrue, Ppred, prior_lims)
 
     # Plot
-    fig, axes = plt.subplots(1, 5, figsize=(18, 3.5), constrained_layout=True)
+    fig = plt.figure(figsize=(18, 7.2), constrained_layout=True)
+    gs = fig.add_gridspec(2, 5, height_ratios=[4.8, 1.1])
+    axes = [fig.add_subplot(gs[0, j]) for j in range(5)]
+    text_axes = [fig.add_subplot(gs[1, j]) for j in range(5)]
+
     for j, name in enumerate(PARAM_NAMES):
         ax = axes[j]
+        text_ax = text_axes[j]
         t = Ptrue[:, j]
         p = Ppred[:, j]
 
@@ -277,12 +287,27 @@ def main():
         hi = max(t.max(), p.max())
         ax.plot([lo, hi], [lo, hi], linewidth=1.0)
 
-        ax.set_title(f"{name}\nrmse={metrics[name]['rmse']:.3g}, corr={metrics[name]['corr']:.3f}")
+        ax.set_title(name)
         ax.set_xlabel("true")
         if j == 0:
             ax.set_ylabel("pred")
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
+        text_ax.axis("off")
+        text_ax.text(
+            0.5,
+            0.9,
+            (
+                f"corr={metrics[name]['corr']:.4f}\n"
+                f"rmse={metrics[name]['rmse']:.4g}\n"
+                f"rmse/range={metrics[name]['rmse_pct']:.1f}%"
+            ),
+            ha="center",
+            va="top",
+            transform=text_ax.transAxes,
+            family="monospace",
+            fontsize=10,
+        )
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_png = os.path.join(outdir, f"diag_{ckpt_prefix}_step{step}_{stamp}.png")
@@ -293,7 +318,11 @@ def main():
     print(f"[OK] Restored: {ckpt_path}")
     print(f"[OK] Saved plot: {out_png}")
     for k in PARAM_NAMES:
-        print(f"  {k:5s}: rmse={metrics[k]['rmse']:.4g}  corr={metrics[k]['corr']:.4f}")
+        print(
+            f"  {k:5s}: rmse={metrics[k]['rmse']:.4g}  "
+            f"corr={metrics[k]['corr']:.4f}  "
+            f"rmse/range={metrics[k]['rmse_pct']:.1f}%"
+        )
 
 
 if __name__ == "__main__":
