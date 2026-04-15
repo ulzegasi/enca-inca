@@ -186,7 +186,8 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
 
     - x:     [L, 1] float32
     - params:[5]    float32  (tau, T, Nd, sigma, Bmax)
-    - noise: [L, C] float32  (Gaussian channels fed to decoder)
+    - noise: [L, C] float32  (downsampled post-warmup view of the same bare
+                              noise realization used to generate x)
 
     where L = Tobs/saveat (requires Tobs divisible by saveat).
     """
@@ -231,7 +232,13 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
         if abs(ratio_w - round(ratio_w)) > 1e-9:
             raise ValueError(f"Twarmup ({self.Twarmup}) must be divisible by saveat ({self.saveat}).")
 
+        ratio_dt = self.saveat / self.dt
+        if abs(ratio_dt - round(ratio_dt)) > 1e-9:
+            raise ValueError(f"saveat ({self.saveat}) must be divisible by dt ({self.dt}) for ENCA noise alignment.")
+
         self.L = int(round(ratio))  # output length after downsampling
+        self.noise_stride = int(round(ratio_dt))
+        self.warmup_steps = int(round(self.Twarmup / self.dt))
 
     def _sample_theta(self):
         tau = float(self.prng.uniform(*self.tau_lims))
@@ -286,11 +293,18 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
 
             params = np.asarray(theta, dtype=np.float32) # [5]
 
-            # decoder noise: match x length L
-            if self.num_noise_channels == 1:
-                noise = self.prng.normal(0.0, 1.0, size=(self.L, 1)).astype(np.float32)
-            else:
-                noise = self.prng.normal(0.0, 1.0, size=(self.L, self.num_noise_channels)).astype(np.float32)
+            # Decoder conditioning uses the same bare-noise realization that generated x.
+            # We keep the post-warmup window and downsample it to match x's [L, C] shape.
+            eps_obs = eps_dt[self.warmup_steps:]
+            noise_1d = eps_obs[::self.noise_stride][:self.L]
+            if noise_1d.shape[0] != self.L:
+                raise ValueError(
+                    f"Downsampled ENCA noise has length {noise_1d.shape[0]}, expected {self.L}. "
+                    f"Check Twarmup={self.Twarmup}, Tobs={self.Tobs}, dt={self.dt}, saveat={self.saveat}."
+                )
+            noise = noise_1d.reshape(self.L, 1)
+            if self.num_noise_channels > 1:
+                noise = np.repeat(noise, self.num_noise_channels, axis=1)
 
             yield (x, params, noise)
             
