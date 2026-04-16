@@ -53,6 +53,160 @@ self.max_training_steps = int(2500)  # full run example: int(3e6)
 self.freq_log = 100
 ```
 
+## SDDE ENCA Loss Configuration
+
+The SDDE ENCA training script [train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) now supports two loss configurations. The active one is selected in `ExpSetup` via:
+
+```python
+self.loss_mode = "balanced_mse"
+```
+
+The available modes are:
+
+- `legacy_chisq`: reproduces the older chi-square-style implementation
+- `balanced_mse`: uses normalized mean-squared errors with consistent reductions for reconstruction and parameter regression
+
+The loss-related settings currently live in `ExpSetup`:
+
+```python
+self.loss_mode = "balanced_mse"
+self.lambda_recon = 1.0
+self.lambda_reg = 1.0
+self.recon_scale_eps = 1e-3
+```
+
+### Legacy Mode
+
+`legacy_chisq` keeps the previous behavior:
+
+- reconstruction uses a chi-square-like relative error along the time axis
+- parameter regression uses a chi-square-like relative error across the batch
+- the total loss is the unweighted sum of reconstruction and regression losses
+
+This mode is kept mainly for backward compatibility and comparison with older runs.
+
+### Balanced Mode
+
+`balanced_mse` is now the default. It is designed so the two losses are reduced in a more comparable way, while still keeping their meanings separate.
+
+Reconstruction loss:
+
+- compute one RMS amplitude scale per sample from the true signal `x`
+- clamp that scale from below with `recon_scale_eps`
+- normalize reconstruction error by that per-sample scale
+- compute plain MSE on the normalized signal
+
+In formula form:
+
+```python
+scale_x = max(sqrt(mean(x^2 over time)), recon_scale_eps)
+loss_reconstruction = mean(((x - x_pred) / scale_x)^2)
+```
+
+Parameter regression loss:
+
+- use only the first 5 latent coordinates for parameter supervision
+- normalize each parameter error by its prior width
+- compute plain MSE on those normalized parameter errors
+
+In formula form:
+
+```python
+loss_regress_params = mean(((params - params_pred[:, :5]) / prior_widths)^2)
+```
+
+The final training objective is:
+
+```python
+loss_total = lambda_recon * loss_reconstruction + lambda_reg * loss_regress_params
+```
+
+with defaults:
+
+```python
+lambda_recon = 1.0
+lambda_reg = 1.0
+```
+
+These defaults are only a starting point. They remove the old reduction mismatch, but they do not guarantee that the two losses will have identical magnitudes during training. If one objective is still clearly under-emphasized, increase its corresponding lambda.
+
+### Why Two Modes Exist
+
+The older implementation could make parameter regression numerically dominate reconstruction because the two losses were reduced differently. The new `balanced_mse` mode addresses that by making both losses true means after normalization.
+
+The legacy mode is still available so that:
+
+- older experiments remain reproducible
+- past checkpoints remain easier to interpret
+- side-by-side comparisons between old and new training objectives remain possible
+
+### How To Switch Modes
+
+Change the following lines in `ExpSetup`:
+
+```python
+self.loss_mode = "balanced_mse"
+self.lambda_recon = 1.0
+self.lambda_reg = 1.0
+```
+
+Examples:
+
+```python
+# new default
+self.loss_mode = "balanced_mse"
+self.lambda_recon = 1.0
+self.lambda_reg = 1.0
+```
+
+```python
+# old behavior
+self.loss_mode = "legacy_chisq"
+self.lambda_recon = 1.0
+self.lambda_reg = 1.0
+```
+
+At startup, the script prints the active loss mode and the two lambda values.
+
+### TensorBoard Scalars
+
+The following top-level TensorBoard scalars are still written in both modes:
+
+- `loss_total`
+- `loss_reconstruction`
+- `loss_regress_params`
+- `RMSE_x_ch_1`
+- `RMSE_z_ch_1` to `RMSE_z_ch_5`
+- `theta/...` parameter min/max ranges
+- `lr_schedule`
+
+In addition, the lambda weights are logged as:
+
+- `loss_weight/lambda_recon`
+- `loss_weight/lambda_reg`
+
+The per-component loss names depend on the selected mode.
+
+If `loss_mode = "legacy_chisq"`, TensorBoard shows:
+
+- `ChiSquare_x_ch_1`
+- `ChiSquare_z_1`
+- `ChiSquare_z_2`
+- `ChiSquare_z_3`
+- `ChiSquare_z_4`
+- `ChiSquare_z_5`
+
+If `loss_mode = "balanced_mse"`, TensorBoard shows:
+
+- `NormMSE_x_ch_1`
+- `NormMSE_z_1`
+- `NormMSE_z_2`
+- `NormMSE_z_3`
+- `NormMSE_z_4`
+- `NormMSE_z_5`
+
+So the high-level dashboard remains similar, but the detailed per-component loss tags change when you switch from the legacy chi-square losses to the normalized MSE losses.
+
 ## Diagnostics And Reconstruction Tests
 
 After training an SDDE ENCA model, you can run the helper scripts `diag_test.py` and `recon_test.py` against a saved run directory. These scripts expect a run folder containing checkpoints and `hyper_parameters.json`, for example under `sdde_ENCA_runs/<run_name>/`.
@@ -131,6 +285,10 @@ The current checked-in environment uses:
 - NumPy, SciPy, pandas, matplotlib, and h5py
 
 Please report any issues if you come across bugs or platform-specific dependency problems.
+
+## Note
+
+For the solar-dynamo / SDDE setting, the currently supported workflow in this repository is the ENCA model. An INCA model for the SDDE case has not been implemented as part of the maintained workflow at this stage. That may be added in the future, but there is no firm commitment yet.
 
 ## Citation  
 

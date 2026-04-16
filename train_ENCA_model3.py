@@ -246,6 +246,14 @@ class ExpSetup:
         self.batch_size = 300
         self.max_training_steps = int(2e6) # int(3000) # int(3e6)
         self.freq_log = 500
+
+        # Loss setup
+        # "legacy_chisq" reproduces the original implementation.
+        # "balanced_mse" uses normalized MSEs with comparable reductions.
+        self.loss_mode = "balanced_mse"
+        self.lambda_recon = 1.0
+        self.lambda_reg = 1.0
+        self.recon_scale_eps = 1e-3
         
         # parameter priors
         self.tau_lims = (0.1, 10.0)
@@ -319,9 +327,16 @@ def main():
             sd = tf.math.squared_difference(y_true, y_pred)
             return tf.math.reduce_sum(sd / tf.math.maximum(tf.math.pow(y_true, 2), 1e-6), axis= -1)
 
+    param_widths = tf.constant([
+        args.tau_lims[1] - args.tau_lims[0],
+        args.T_lims[1] - args.T_lims[0],
+        args.Nd_lims[1] - args.Nd_lims[0],
+        args.sigma_lims[1] - args.sigma_lims[0],
+        args.Bmax_lims[1] - args.Bmax_lims[0],
+    ], dtype=tf.float32)
 
     @tf.function
-    def loss_reconstruction_fn(x, x_pred, return_each_dim=False):
+    def loss_reconstruction_fn_legacy(x, x_pred, return_each_dim=False):
         if return_each_dim:
             d = {}
             for i in range(x.shape[-1]): # do over all channels of observation (it's just 1 in our example.)
@@ -330,9 +345,10 @@ def main():
             return d
         else:
             # return tf.keras.losses.MeanSquaredError(name='MSE')(x,x_pred)
-            return ChiSquareStatistic(name='ChiSquare')(x,x_pred) / args.len_timeseries 
+            return ChiSquareStatistic(name='ChiSquare')(x,x_pred) / args.len_timeseries
+
     @tf.function
-    def loss_regress_params_fn(params, params_pred, return_each_dim=False):
+    def loss_regress_params_fn_legacy(params, params_pred, return_each_dim=False):
         ''' Notice params_pred can have more dimensions than params (free dimensions).
         If not using this loss, return 0. instead.'''
         num_params = params._shape_as_list()[-1]
@@ -348,6 +364,46 @@ def main():
                 # loss += tf.keras.losses.MeanSquaredError(name='loss_param_%d'%(i+1))(params[...,i], params_pred[...,i])
                 loss += ChiSquareStatistic(name='ChiSquare_z_%d'%(i+1))(params[...,i], params_pred[...,i]) / num_params
             return loss
+
+    @tf.function
+    def loss_reconstruction_fn_balanced(x, x_pred, return_each_dim=False):
+        """
+        Per-sample normalized MSE:
+          1. compute one RMS amplitude scale per sample and channel
+          2. normalize reconstruction error by that scale
+          3. average over time, then over batch
+        """
+        rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
+        rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
+        sq_error = tf.square((x - x_pred) / rms_scale)
+        per_sample_channel = tf.reduce_mean(sq_error, axis=1)  # [batch, channels]
+
+        if return_each_dim:
+            d = {}
+            for i in range(x.shape[-1]):
+                d[f'NormMSE_x_ch_{i+1}'] = tf.reduce_mean(per_sample_channel[:, i])
+            return d
+
+        return tf.reduce_mean(per_sample_channel)
+
+    @tf.function
+    def loss_regress_params_fn_balanced(params, params_pred, return_each_dim=False):
+        """
+        Mean squared error after normalizing each parameter by its prior width.
+        Only the first num_model_parameters latent dimensions are supervised.
+        """
+        num_params = params._shape_as_list()[-1]
+        params_pred_used = params_pred[..., :num_params]
+        widths = tf.cast(param_widths[:num_params], params.dtype)
+        sq_error = tf.square((params - params_pred_used) / widths)
+
+        if return_each_dim:
+            d = {}
+            for i in range(num_params):
+                d[f'NormMSE_z_{i+1}'] = tf.reduce_mean(sq_error[:, i])
+            return d
+
+        return tf.reduce_mean(sq_error)
     # Define additional metrics for logging at every
 
     ##################################################################################################
@@ -412,13 +468,22 @@ def main():
             z_latent = model.encoder(x, training=True)
             x_reconst = model.decoder((z_latent, noise), training=True)
 
-            dict_reconstruction = loss_reconstruction_fn(x, x_reconst, return_each_dim=True)
-            loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
+            if args.loss_mode == "legacy_chisq":
+                dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
 
-            dict_regression = loss_regress_params_fn(params, z_latent, return_each_dim=True)
-            loss_regress_params = tf.reduce_sum(list(dict_regression.values()))
+                dict_regression = loss_regress_params_fn_legacy(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_sum(list(dict_regression.values()))
+            elif args.loss_mode == "balanced_mse":
+                dict_reconstruction = loss_reconstruction_fn_balanced(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
 
-            loss = loss_reconstruction + loss_regress_params
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            else:
+                raise ValueError(f"Unknown loss_mode: {args.loss_mode}")
+
+            loss = args.lambda_recon * loss_reconstruction + args.lambda_reg * loss_regress_params
 
         trainable_variables = model.encoder.trainable_variables + model.decoder.trainable_variables
         gradients = tape.gradient(loss, trainable_variables)
@@ -428,7 +493,7 @@ def main():
 
         optimizer.apply_gradients(zip(gradients, trainable_variables))
 
-        return (loss_reconstruction, loss_regress_params), (z_latent, x_reconst), (dict_reconstruction, dict_regression)
+        return (loss_reconstruction, loss_regress_params, loss), (z_latent, x_reconst), (dict_reconstruction, dict_regression)
     ##################################################################################################
     # Define a few metrics to export to tensorboard
     avg_loss_total = tf.keras.metrics.Mean(name='loss_total', dtype=tf.float32) # variable will keep track of average of loss value since last freq_log
@@ -470,6 +535,7 @@ def main():
     print("x stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+    print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
     # --- warm up tf.function tracing/compilation ---
     print("Warming up train_step (tf.function tracing/compilation)...")
@@ -491,8 +557,7 @@ def main():
 
         # unpack
         z_latent, x_reconst = z_and_x
-        loss_reconstruction, loss_regress_params = loss_tuple
-        loss_total = loss_reconstruction + loss_regress_params
+        loss_reconstruction, loss_regress_params, loss_total = loss_tuple
         dict_rec, dict_reg = dict_mse
 
         # 3) NaN/Inf guard
@@ -555,6 +620,8 @@ def main():
                 'loss_total': avg_loss_total.result(),
                 'loss_reconstruction': avg_loss_recon.result(),
                 'loss_regress_params': avg_loss_reg_p.result(),
+                'loss_weight/lambda_recon': tf.constant(args.lambda_recon, dtype=tf.float32),
+                'loss_weight/lambda_reg': tf.constant(args.lambda_reg, dtype=tf.float32),
             }
 
             # --- Parameter ranges in current batch ---
@@ -729,6 +796,8 @@ class Sampler:
         else:
             for attr in dir(self.args):
                 if not attr.startswith('__') and attr not in ['logdir', 'batch_size']:  # don't get methods, ignore logdir and batch_size, as the optimization could have been done elsewhere.
+                    if not hasattr(hp_manager.args, attr):
+                        continue
                     if getattr(self.args, attr) != getattr(hp_manager.args, attr):
                         raise AssertionError('Mismatch of hyper-parameter attributes in the logdir %s and ExpSetup file in this script for attribute: %s' % (self.args.logdir, attr))
 
