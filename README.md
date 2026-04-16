@@ -53,6 +53,63 @@ self.max_training_steps = int(2500)  # full run example: int(3e6)
 self.freq_log = 100
 ```
 
+## Diagnostics And Reconstruction Tests
+
+After training an SDDE ENCA model, you can run the helper scripts `diag_test.py` and `recon_test.py` against a saved run directory. These scripts expect a run folder containing checkpoints and `hyper_parameters.json`, for example under `sdde_ENCA_runs/<run_name>/`.
+
+The diagonal test evaluates how well the encoder recovers the physical parameters from synthetic samples and writes a plot into `<run>/diagnostics/`:
+
+```bash
+python diag_test.py --logdir sdde_ENCA_runs/<run_name>
+```
+
+Useful options:
+
+```bash
+# use the latest "best" checkpoint (default)
+python diag_test.py --logdir sdde_ENCA_runs/<run_name> --best
+
+# use the latest regular checkpoint instead
+python diag_test.py --logdir sdde_ENCA_runs/<run_name> --last
+
+# change the number of synthetic test samples
+python diag_test.py --logdir sdde_ENCA_runs/<run_name> --nsamples 2000
+```
+
+The reconstruction test fixes one parameter setting, samples one or more noise realizations, reconstructs the resulting trajectories, and saves a comparison plot into `<run>/diagnostics/`:
+
+```bash
+python recon_test.py \
+  --logdir sdde_ENCA_runs/<run_name> \
+  --tau 2.0 \
+  --T 3.0 \
+  --Nd 8.0 \
+  --sigma 0.12 \
+  --Bmax 10.0
+```
+
+Useful options:
+
+```bash
+# aggregate several noise realizations for the same parameters
+python recon_test.py \
+  --logdir sdde_ENCA_runs/<run_name> \
+  --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
+  --nseeds 8
+
+# evaluate the last checkpoint instead of the best one
+python recon_test.py \
+  --logdir sdde_ENCA_runs/<run_name> \
+  --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
+  --last
+```
+
+Notes:
+
+- Both scripts are intended for SDDE / solar-dynamo ENCA runs and rely on the saved hyperparameters from training.
+- `recon_test.py` checks that the supplied parameter values stay within the saved prior limits.
+- As with SDDE training, Julia must be available because both scripts initialize `juliacall` before importing TensorFlow.
+
 ## Julia Requirement
 
 The SDDE training scripts (`train_ENCA_model3.py` and `train_INCA_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
