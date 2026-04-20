@@ -227,7 +227,7 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("ENCA_LOGDIR", default_logdir)
 
-        self.ndims_latent = 10
+        self.ndims_latent = 6
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
 
@@ -255,7 +255,7 @@ class ExpSetup:
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
         
-        # parameter priors
+        """ # parameter priors
         self.tau_lims = (0.1, 10.0)
         self.T_lims = (0.1, 10.0)
         self.Nd_lims = (1.0, 15.0)
@@ -264,7 +264,15 @@ class ExpSetup:
         # Try something different:
         self.sigma_lims = (0.005, 0.05)
         # --------------------------------------------------------
-        self.Bmax_lims = (1.0, 15.0)
+        self.Bmax_lims = (1.0, 15.0) """
+        
+        # parameter priors for "easy training"
+        self.tau_lims = (4.0, 10.0)
+        self.T_lims = (4.0, 10.0)
+        self.Nd_lims = (9.5, 15.0)
+        self.sigma_lims = (0.005, 0.05)
+        # --------------------------------------------------------
+        self.Bmax_lims = (4.0, 15.0)
         
 ##################################################################################################
 def main():
