@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=enca1z10
+#SBATCH --job-name=enca2z10
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -37,7 +37,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
-export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_1
+export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_2
 mkdir -p "$ENCA_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
