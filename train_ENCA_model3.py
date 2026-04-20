@@ -512,6 +512,7 @@ def main():
     ##################################################################################################
     # Execute training loop
     step = 0  # will survive after loop
+    last_step_saved = False
     
     gen_iter = iter(gen_train)
     
@@ -565,9 +566,7 @@ def main():
 
         # 4) step / stopping
         step = int(optimizer.iterations.numpy())
-        if step >= args.max_training_steps:
-            logging.info("Training is completed.")
-            break
+        reached_max_steps = step >= args.max_training_steps
 
         # 5) metrics + logging + checkpoints
 
@@ -614,7 +613,7 @@ def main():
         # ------------------------------------------------
         # Logging block
         # ------------------------------------------------
-        if step % args.freq_log == 0:
+        if (step % args.freq_log == 0) or reached_max_steps:
 
             d_scalars = {
                 'loss_total': avg_loss_total.result(),
@@ -691,11 +690,12 @@ def main():
             export_summary_histograms(d_histograms, step=step, writer=summary_writer)
 
             save(save_manager, ckpt_number=step)
+            last_step_saved = True
 
         # ------------------------------------------------
         # Long-term best model check
         # ------------------------------------------------
-        if step % (10 * args.freq_log) == 0:
+        if (step % (10 * args.freq_log) == 0) or reached_max_steps:
 
             current_long_loss = float(avg_loss_long_term.result().numpy())
 
@@ -709,11 +709,16 @@ def main():
 
                 save(save_manager_best, ckpt_number=step)
 
+        if reached_max_steps:
+            logging.info("Training is completed.")
+            break
+
 
     # ------------------------------------------------
     # Final save after exiting loop
     # ------------------------------------------------
-    save(save_manager, ckpt_number=step)
+    if not last_step_saved:
+        save(save_manager, ckpt_number=step)
 
 class Sampler:
     '''Class provides user friendly access to low-dimensional space for summary statistics analysis.'''
