@@ -217,7 +217,19 @@ The diagonal test evaluates how well the encoder recovers the physical parameter
 python diag_test.py --logdir sdde_ENCA_runs/<run_name>
 ```
 
-Useful options:
+CLI options:
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--logdir <path>` | yes | - | Run directory containing checkpoints and `hyper_parameters.json`. |
+| `--nsamples <int>` | no | `1000` | Number of synthetic samples to generate for the diagonal test. |
+| `--batch <int>` | no | `64` | Batch size used for encoder forward passes. |
+| `--seed <int>` | no | `1234` | Random seed used to generate the synthetic test samples. |
+| `--outdir <path>` | no | `<run>/diagnostics` | Directory where the diagnostic plot is written. |
+| `--best` | no | enabled by default | Use the latest `model_best_ckpt-*` checkpoint. Mutually exclusive with `--last`. |
+| `--last` | no | disabled | Use the latest regular `model_ckpt-*` checkpoint. Mutually exclusive with `--best`. |
+
+Examples:
 
 ```bash
 # use the latest "best" checkpoint (default)
@@ -228,6 +240,9 @@ python diag_test.py --logdir sdde_ENCA_runs/<run_name> --last
 
 # change the number of synthetic test samples
 python diag_test.py --logdir sdde_ENCA_runs/<run_name> --nsamples 2000
+
+# write outputs somewhere else and change the encoder batch size
+python diag_test.py --logdir sdde_ENCA_runs/<run_name> --outdir diagnostics/manual --batch 128
 ```
 
 The reconstruction test fixes one parameter setting, samples one or more noise realizations, reconstructs the resulting trajectories, and saves a comparison plot into `<run>/diagnostics/`:
@@ -242,7 +257,23 @@ python recon_test.py \
   --Bmax 10.0
 ```
 
-Useful options:
+CLI options:
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--logdir <path>` | yes | - | Run directory containing checkpoints and `hyper_parameters.json`. |
+| `--tau <float>` | yes | - | Fixed `tau` value for the generated reconstruction sample. |
+| `--T <float>` | yes | - | Fixed `T` value for the generated reconstruction sample. |
+| `--Nd <float>` | yes | - | Fixed `Nd` value for the generated reconstruction sample. |
+| `--sigma <float>` | yes | - | Fixed `sigma` value for the generated reconstruction sample. |
+| `--Bmax <float>` | yes | - | Fixed `Bmax` value for the generated reconstruction sample. |
+| `--seed <int>` | no | `1234` | First random seed used for sampled driving noise. With `--nseeds`, seeds are used consecutively from `seed` to `seed + nseeds - 1`. |
+| `--nseeds <int>` | no | `1` | Number of noise realizations to aggregate for the same fixed parameters. Must be at least `1`. |
+| `--outdir <path>` | no | `<run>/diagnostics` | Directory where the reconstruction comparison plot is written. |
+| `--best` | no | enabled by default | Use the latest `model_best_ckpt-*` checkpoint. Mutually exclusive with `--last`. |
+| `--last` | no | disabled | Use the latest regular `model_ckpt-*` checkpoint. Mutually exclusive with `--best`. |
+
+Examples:
 
 ```bash
 # aggregate several noise realizations for the same parameters
@@ -256,6 +287,13 @@ python recon_test.py \
   --logdir sdde_ENCA_runs/<run_name> \
   --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
   --last
+
+# choose the starting random seed and output directory
+python recon_test.py \
+  --logdir sdde_ENCA_runs/<run_name> \
+  --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
+  --seed 2024 \
+  --outdir diagnostics/manual
 ```
 
 Notes:
