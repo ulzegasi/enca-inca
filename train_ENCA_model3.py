@@ -227,7 +227,7 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("ENCA_LOGDIR", default_logdir)
 
-        self.ndims_latent = 6
+        self.ndims_latent = 10
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
 

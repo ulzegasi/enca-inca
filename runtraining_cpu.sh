@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=encaCPU300
+#SBATCH --job-name=enca3z10ccpu
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=02:00:00
+#SBATCH --time=8-00:00:00
 #SBATCH --partition=earth-3
 #SBATCH --no-requeue
 #SBATCH --constraint=rhel8
@@ -31,8 +31,15 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs
 
-export TF_CPP_MIN_LOG_LEVEL=2
+# For the first launch, keep the automatic date stamp.
+# For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
+RUNSTAMP=$(date +%Y%m%d)
+export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10c_3_cpu
+mkdir -p "$ENCA_LOGDIR"
+
+export TF_CPP_MIN_LOG_LEVEL=3
 export CUDA_VISIBLE_DEVICES=""
+export TF_ENABLE_ONEDNN_OPTS=0
 
 export MPLCONFIGDIR=/cfs/earth/scratch/ulzg/.cache/matplotlib
 mkdir -p "$MPLCONFIGDIR"
@@ -48,10 +55,12 @@ python --version
 echo "Julia depot: $JULIA_DEPOT_PATH"
 echo "Julia used: $(command -v julia)"
 julia -v || true
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "ENCA_LOGDIR=$ENCA_LOGDIR"
 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 
 # ==============================
 # Run
 # ==============================
-srun --cpu-bind=cores python train_ENCA_model3.py
+srun --export=ALL,ENCA_LOGDIR="$ENCA_LOGDIR" --cpu-bind=cores python train_ENCA_model3.py
 

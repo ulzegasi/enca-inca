@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-#SBATCH --job-name=enca2z10
+#SBATCH --job-name=enca3z20b
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
 #
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=40
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
-#SBATCH --time=04-00:00:00
-#SBATCH --partition=earth-5
+#SBATCH --time=4-00:00:00
+#SBATCH --partition=earth-4
 #SBATCH --no-requeue
 #SBATCH --constraint=rhel8
 #SBATCH --mail-type=fail,end
@@ -37,7 +37,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
-export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z10_2
+export ENCA_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCA_runs/${RUNSTAMP}_enca_z20b_3
 mkdir -p "$ENCA_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
