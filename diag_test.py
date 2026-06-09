@@ -22,6 +22,7 @@ import argparse
 import datetime
 import json
 import numpy as np
+from typing import Optional
 
 # IMPORTANT: init_julia() must happen before importing tensorflow
 from julia_bootstrap import init_julia
@@ -75,12 +76,40 @@ def find_latest_checkpoint(logdir: str, ckpt_prefix: str) -> str:
     return best.replace(".index", "")
 
 
-def build_encoder_decoder(len_timeseries: int, ndims_latent: int, num_noise_channels: int):
+def build_encoder_decoder(
+    len_timeseries: int,
+    ndims_latent: int,
+    num_noise_channels: int,
+    representation_mode: str = "time",
+    num_fft_components: Optional[int] = None,
+):
     """
     Rebuilds the SAME architecture as training script (encoder+decoder).
     Only encoder is used for diagonal test, but we include decoder in checkpoint
     to match saved objects.
     """
+
+    if representation_mode == "fourier_amplitude":
+        if num_fft_components is None:
+            raise ValueError("num_fft_components is required for fourier_amplitude mode")
+
+        x_input = tf.keras.layers.Input(shape=[num_fft_components], name="fft_amplitudes")
+        x = tf.keras.layers.Dense(256, activation="relu", name="enc_dense_1")(x_input)
+        x = tf.keras.layers.Dense(256, activation="relu", name="enc_dense_2")(x)
+        x = tf.keras.layers.Dense(128, activation="relu", name="enc_dense_3")(x)
+        z = tf.keras.layers.Dense(ndims_latent, activation=None, name="latent_space")(x)
+        encoder = tf.keras.Model(inputs=x_input, outputs=z)
+
+        latent_mappings = tf.keras.layers.Input(shape=[ndims_latent], name="latent_representations")
+        y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(latent_mappings)
+        y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_2")(y)
+        y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_3")(y)
+        y = tf.keras.layers.Dense(num_fft_components, activation=None, name="pred_fft_amplitudes")(y)
+        decoder = tf.keras.Model(inputs=latent_mappings, outputs=y)
+        return encoder, decoder
+
+    if representation_mode != "time":
+        raise ValueError(f"Unknown representation_mode: {representation_mode}")
 
     # ---- Encoder ----
     conv_fn = lambda filters, act=None, name=None: tf.keras.layers.Conv1D(
@@ -128,6 +157,19 @@ def build_encoder_decoder(len_timeseries: int, ndims_latent: int, num_noise_chan
     decoder = tf.keras.Model(inputs=(latent_mappings, noise_vectors), outputs=y)
 
     return encoder, decoder
+
+
+def timeseries_to_fft_log_amplitudes_np(
+    x: np.ndarray,
+    num_fft_components: int,
+    fft_log_eps: float,
+) -> np.ndarray:
+    """Map [N, time, 1] signals to log normalized FFT amplitudes [N, n_fft]."""
+    x_1d = np.squeeze(x, axis=-1).astype(np.float32)
+    n_time = x_1d.shape[1]
+    window = np.hanning(n_time).astype(np.float32)
+    amplitudes = np.abs(np.fft.fft(x_1d * window[None, :], axis=1)) / float(n_time)
+    return np.log(amplitudes[:, :num_fft_components] + fft_log_eps).astype(np.float32)
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, prior_lims):
@@ -193,6 +235,9 @@ def main():
 
     ndims_latent       = int(hp.get("ndims_latent", 20))
     num_noise_channels = int(hp.get("num_noise_channels", 1))
+    representation_mode = hp.get("representation_mode", "time")
+    num_fft_components = int(hp.get("num_fft_components", 100))
+    fft_log_eps = float(hp.get("fft_log_eps", 1e-8))
 
     tau_lims   = _as_tuple(hp.get("tau_lims",   (0.1, 10.0)))
     T_lims     = _as_tuple(hp.get("T_lims",     (0.1, 10.0)))
@@ -211,7 +256,9 @@ def main():
     encoder, decoder = build_encoder_decoder(
         len_timeseries=len_timeseries,
         ndims_latent=ndims_latent,
-        num_noise_channels=num_noise_channels
+        num_noise_channels=num_noise_channels,
+        representation_mode=representation_mode,
+        num_fft_components=num_fft_components,
     )
 
     ckpt = tf.train.Checkpoint(encoder=encoder, decoder=decoder)
@@ -249,14 +296,26 @@ def main():
     )
     it = iter(gen)
 
-    # Collect samples
-    X = np.zeros((args.nsamples, len_timeseries, 1), dtype=np.float32)
+    # Collect samples. In Fourier mode, X_raw is converted to the same
+    # Hann-windowed log FFT amplitudes used by the training loop.
+    X_raw = np.zeros((args.nsamples, len_timeseries, 1), dtype=np.float32)
     Ptrue = np.zeros((args.nsamples, 5), dtype=np.float32)
 
     for i in range(args.nsamples):
         x0, p0, _ = next(it)
-        X[i] = x0
+        X_raw[i] = x0
         Ptrue[i] = p0
+
+    if representation_mode == "fourier_amplitude":
+        X = timeseries_to_fft_log_amplitudes_np(
+            X_raw,
+            num_fft_components=num_fft_components,
+            fft_log_eps=fft_log_eps,
+        )
+    elif representation_mode == "time":
+        X = X_raw
+    else:
+        raise ValueError(f"Unknown representation_mode: {representation_mode}")
 
     # Forward pass in batches
     Z = np.zeros((args.nsamples, ndims_latent), dtype=np.float32)
@@ -311,7 +370,10 @@ def main():
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_png = os.path.join(outdir, f"diag_{ckpt_prefix}_step{step}_{stamp}.png")
-    fig.suptitle(f"Diagonal test @ step {step} ({ckpt_prefix}) | nsamples={args.nsamples} | ndims_latent={ndims_latent}")
+    fig.suptitle(
+        f"Diagonal test @ step {step} ({ckpt_prefix}) | nsamples={args.nsamples} | "
+        f"ndims_latent={ndims_latent} | representation={representation_mode}"
+    )
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
 

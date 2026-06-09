@@ -9673,7 +9673,7 @@ ghE=
 }, Open  ]]
 },
 WindowSize->{854, 828},
-WindowMargins->{{Automatic, 232}, {Automatic, 26}},
+WindowMargins->{{286, Automatic}, {Automatic, 21}},
 FrontEndVersion->"14.3 for Mac OS X ARM (64-bit) (July 8, 2025)",
 StyleDefinitions->"Default.nb",
 ExpressionUUID->"dc67c60b-5f4f-4c93-9f1b-97969243dfc0"
