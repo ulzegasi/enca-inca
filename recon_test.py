@@ -293,6 +293,10 @@ def main():
     chi_per_seed = np.array([relative_chisq(x_true_all[i], x_pred_all[i]) for i in range(args.nseeds)])
     rmse = float(np.mean(rmse_per_seed))
     chi = float(np.mean(chi_per_seed))
+    flat_mean_pred = float(np.mean(x_true_all))
+    flat_mean_rmse_per_seed = np.sqrt(np.mean((x_true_all - flat_mean_pred) ** 2, axis=1))
+    flat_mean_rmse = float(np.mean(flat_mean_rmse_per_seed))
+    performance_vs_flat_mean = float("nan") if flat_mean_rmse == 0.0 else 1.0 - rmse / flat_mean_rmse
     step = int(os.path.basename(ckpt_path).split("-")[-1])
     if representation_mode == "fourier_amplitude":
         x_axis = np.arange(observation_length)
@@ -330,7 +334,9 @@ def main():
     summary = (
         f"tau={params_true[0]:.4g}, T={params_true[1]:.4g}, Nd={params_true[2]:.4g}, "
         f"sigma={params_true[3]:.4g}, Bmax={params_true[4]:.4g}\n"
-        f"mean RMSE={rmse:.4g}, mean relative_chisq={chi:.4g}, seeds={args.seed}..{args.seed + args.nseeds - 1} (n={args.nseeds})"
+        f"mean RMSE={rmse:.4g}, flat baseline RMSE={flat_mean_rmse:.4g}, "
+        f"performance={performance_vs_flat_mean:.4g}, mean relative_chisq={chi:.4g}, "
+        f"seeds={args.seed}..{args.seed + args.nseeds - 1} (n={args.nseeds})"
     )
     text_ax.axis("off")
     text_ax.text(
@@ -363,7 +369,13 @@ def main():
         f"  tau={params_true[0]:.6g}  T={params_true[1]:.6g}  Nd={params_true[2]:.6g}  "
         f"sigma={params_true[3]:.6g}  Bmax={params_true[4]:.6g}"
     )
-    print(f"Metrics: mean_RMSE={rmse:.6g}  mean_relative_chisq={chi:.6g}  nseeds={args.nseeds}")
+    flat_mean_name = "flat_mean_spectrum" if representation_mode == "fourier_amplitude" else "flat_mean_signal"
+    print(
+        f"Metrics: mean_RMSE={rmse:.6g}  mean_relative_chisq={chi:.6g}  "
+        f"{flat_mean_name}_baseline_RMSE={flat_mean_rmse:.6g}  "
+        f"performance_vs_{flat_mean_name}_baseline={performance_vs_flat_mean:.6g}  "
+        f"nseeds={args.nseeds}"
+    )
 
 
 if __name__ == "__main__":
