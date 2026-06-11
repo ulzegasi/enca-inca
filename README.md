@@ -11,9 +11,10 @@ The repository contains the code needed to train the proposed models _explicit n
 
 - `train_ENCA_model1.py`, `train_INCA_model1.py`: original model 1 experiments
 - `train_ENCA_model2.py`, `train_INCA_model2.py`: original model 2 experiments
-- `train_ENCA_model3.py`, `train_INCA_model3.py`: solar-dynamo / SDDE experiments using the Julia-backed simulator
+- `train_ENCA_model3.py`: solar-dynamo / SDDE ENCA experiments using the Julia-backed simulator
+- `train_MLP_model3.py`: solar-dynamo / SDDE MLP experiments on Fourier-amplitude representations
 
-Supporting code lives in `src/`, and local training outputs are written to `sdde_ENCA_runs/` when running the newer SDDE scripts.
+Supporting code lives in `src/`. Local solar-dynamo training outputs are written to `sdde_ENCA_runs/` for ENCA and `sdde_MLP_runs/` for MLP.
 
 ## Demo   
 The repository can be set up on a clean environment by creating a conda environment:
@@ -38,10 +39,10 @@ For the solar-dynamo / SDDE experiments, use:
 
 ```bash
 python train_ENCA_model3.py
-python train_INCA_model3.py
+python train_MLP_model3.py
 ```
 
-Before launching one of these training scripts, manually review the `ExpSetup` class in [train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) and set the key run parameters there. In particular:
+Before launching one of these training scripts, manually review the `ExpSetup` class in the script you are running and set the key run parameters there. In particular:
 
 ```python
 self.ndims_latent = 10
@@ -53,9 +54,35 @@ self.max_training_steps = int(2500)  # full run example: int(3e6)
 self.freq_log = 100
 ```
 
-## SDDE ENCA Loss Configuration
+## SDDE Model Architectures
 
-The SDDE ENCA training script [train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) now supports two loss configurations. The active one is selected in `ExpSetup` via:
+The solar-dynamo / SDDE workflows are split by script so the architecture and data representation are explicit.
+
+### ENCA
+
+[train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) is the time-domain ENCA model. It keeps `representation_mode = "time"` in `ExpSetup` for checkpoint metadata compatibility.
+
+- input representation: time series with shape `[batch, len_timeseries, 1]`
+- encoder: Conv1D blocks with ReLU activations and max pooling, followed by a final Conv1D and global average pooling into the latent summary vector
+- decoder: latent vector tiled across time, concatenated with the sampled noise vector, then reconstructed with two bidirectional LSTM layers and a final dense output layer
+- default output directory: `sdde_ENCA_runs/`
+- logdir override: `ENCA_LOGDIR=/path/to/run`
+- cluster launchers: `runtraining_cpu.sh`, `runtraining_gpu.sh`
+
+### MLP
+
+[train_MLP_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_MLP_model3.py) is the Fourier-amplitude MLP autoencoder. It keeps `representation_mode = "fourier_amplitude"` in `ExpSetup` for checkpoint metadata compatibility.
+
+- input representation: Hann-windowed log normalized FFT amplitudes with shape `[batch, num_fft_components]`
+- encoder: `Dense(256, relu) -> Dense(256, relu) -> Dense(128, relu) -> Dense(ndims_latent)`
+- decoder: `Dense(128, relu) -> Dense(256, relu) -> Dense(256, relu) -> Dense(num_fft_components)`
+- default output directory: `sdde_MLP_runs/`
+- logdir override: `MLP_LOGDIR=/path/to/run`
+- cluster launchers: `runtraining_cpu_mlp.sh`, `runtraining_gpu_mlp.sh`
+
+## SDDE Loss Configuration
+
+The SDDE training scripts [train_ENCA_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCA_model3.py) and [train_MLP_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_MLP_model3.py) support two loss configurations. The active one is selected in `ExpSetup` via:
 
 ```python
 self.loss_mode = "balanced_mse"
@@ -91,7 +118,7 @@ This mode is kept mainly for backward compatibility and comparison with older ru
 
 Reconstruction loss:
 
-- compute one RMS amplitude scale per sample from the true signal `x`
+- compute one RMS amplitude scale per sample from the true observation `x`
 - clamp that scale from below with `recon_scale_eps`
 - normalize reconstruction error by that per-sample scale
 - compute plain MSE on the normalized signal
@@ -99,9 +126,11 @@ Reconstruction loss:
 In formula form:
 
 ```python
-scale_x = max(sqrt(mean(x^2 over time)), recon_scale_eps)
+scale_x = max(sqrt(mean(x^2 over observation dimensions)), recon_scale_eps)
 loss_reconstruction = mean(((x - x_pred) / scale_x)^2)
 ```
+
+For ENCA, the observation dimensions are the time-domain trajectory samples. For MLP, they are the Hann-windowed log FFT amplitude components.
 
 Parameter regression loss:
 
@@ -175,7 +204,8 @@ The following top-level TensorBoard scalars are still written in both modes:
 - `loss_total`
 - `loss_reconstruction`
 - `loss_regress_params`
-- `RMSE_x_ch_1`
+- ENCA: `RMSE_x_ch_1`
+- MLP: `RMSE_observation`
 - `RMSE_z_ch_1` to `RMSE_z_ch_5`
 - `theta/...` parameter min/max ranges
 - `lr_schedule`
@@ -187,35 +217,67 @@ In addition, the lambda weights are logged as:
 
 The per-component loss names depend on the selected mode.
 
-If `loss_mode = "legacy_chisq"`, TensorBoard shows:
+If `loss_mode = "legacy_chisq"`, TensorBoard shows reconstruction and latent-parameter chi-square tags. For ENCA, the reconstruction tag is:
 
 - `ChiSquare_x_ch_1`
+
+For MLP, the legacy reconstruction tags follow the observation-vector indexing used by the script:
+
+- `ChiSquare_x_ch_1` to `ChiSquare_x_ch_<num_fft_components>`
+
+Both scripts also show:
+
 - `ChiSquare_z_1`
 - `ChiSquare_z_2`
 - `ChiSquare_z_3`
 - `ChiSquare_z_4`
 - `ChiSquare_z_5`
 
-If `loss_mode = "balanced_mse"`, TensorBoard shows:
+If `loss_mode = "balanced_mse"`, TensorBoard shows the normalized latent-parameter tags in both scripts:
 
-- `NormMSE_x_ch_1`
 - `NormMSE_z_1`
 - `NormMSE_z_2`
 - `NormMSE_z_3`
 - `NormMSE_z_4`
 - `NormMSE_z_5`
 
+The reconstruction tag differs by script:
+
+ENCA uses `NormMSE_x_ch_1`; MLP uses `NormMSE_observation`.
+
 So the high-level dashboard remains similar, but the detailed per-component loss tags change when you switch from the legacy chi-square losses to the normalized MSE losses.
 
 ## Diagnostics And Reconstruction Tests
 
-After training an SDDE ENCA model, you can run the helper scripts `diag_test.py` and `recon_test.py` against a saved run directory. These scripts expect a run folder containing checkpoints and `hyper_parameters.json`, for example under `sdde_ENCA_runs/<run_name>/`.
+After training an SDDE model, run the matching helper scripts against a saved run directory containing checkpoints and `hyper_parameters.json`.
 
-The diagonal test evaluates how well the encoder recovers the physical parameters from synthetic samples and writes a plot into `<run>/diagnostics/`:
+For ENCA runs:
 
 ```bash
-python diag_test.py --logdir sdde_ENCA_runs/<run_name>
+python diag_test_enca.py --logdir sdde_ENCA_runs/<run_name>
+python recon_test_enca.py \
+  --logdir sdde_ENCA_runs/<run_name> \
+  --tau 2.0 \
+  --T 3.0 \
+  --Nd 8.0 \
+  --sigma 0.12 \
+  --Bmax 10.0
 ```
+
+For MLP runs:
+
+```bash
+python diag_test_mlp.py --logdir sdde_MLP_runs/<run_name>
+python recon_test_mlp.py \
+  --logdir sdde_MLP_runs/<run_name> \
+  --tau 2.0 \
+  --T 3.0 \
+  --Nd 8.0 \
+  --sigma 0.12 \
+  --Bmax 10.0
+```
+
+The diagonal tests evaluate how well the encoder recovers the physical parameters from synthetic samples and write a plot into `<run>/diagnostics/`.
 
 CLI options:
 
@@ -233,29 +295,19 @@ Examples:
 
 ```bash
 # use the latest "best" checkpoint (default)
-python diag_test.py --logdir sdde_ENCA_runs/<run_name> --best
+python diag_test_enca.py --logdir sdde_ENCA_runs/<run_name> --best
 
 # use the latest regular checkpoint instead
-python diag_test.py --logdir sdde_ENCA_runs/<run_name> --last
+python diag_test_mlp.py --logdir sdde_MLP_runs/<run_name> --last
 
 # change the number of synthetic test samples
-python diag_test.py --logdir sdde_ENCA_runs/<run_name> --nsamples 2000
+python diag_test_enca.py --logdir sdde_ENCA_runs/<run_name> --nsamples 2000
 
 # write outputs somewhere else and change the encoder batch size
-python diag_test.py --logdir sdde_ENCA_runs/<run_name> --outdir diagnostics/manual --batch 128
+python diag_test_mlp.py --logdir sdde_MLP_runs/<run_name> --outdir diagnostics/manual --batch 128
 ```
 
-The reconstruction test fixes one parameter setting, samples one or more noise realizations, reconstructs the resulting trajectories, and saves a comparison plot into `<run>/diagnostics/`:
-
-```bash
-python recon_test.py \
-  --logdir sdde_ENCA_runs/<run_name> \
-  --tau 2.0 \
-  --T 3.0 \
-  --Nd 8.0 \
-  --sigma 0.12 \
-  --Bmax 10.0
-```
+The reconstruction tests fix one parameter setting, sample one or more noise realizations, reconstruct the relevant representation, and save a comparison plot into `<run>/diagnostics/`. ENCA reconstruction compares time-domain trajectories. MLP reconstruction compares Hann-windowed log FFT amplitude vectors.
 
 CLI options:
 
@@ -277,19 +329,19 @@ Examples:
 
 ```bash
 # aggregate several noise realizations for the same parameters
-python recon_test.py \
+python recon_test_enca.py \
   --logdir sdde_ENCA_runs/<run_name> \
   --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
   --nseeds 8
 
 # evaluate the last checkpoint instead of the best one
-python recon_test.py \
-  --logdir sdde_ENCA_runs/<run_name> \
+python recon_test_mlp.py \
+  --logdir sdde_MLP_runs/<run_name> \
   --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
   --last
 
 # choose the starting random seed and output directory
-python recon_test.py \
+python recon_test_enca.py \
   --logdir sdde_ENCA_runs/<run_name> \
   --tau 2.0 --T 3.0 --Nd 8.0 --sigma 0.12 --Bmax 10.0 \
   --seed 2024 \
@@ -298,13 +350,13 @@ python recon_test.py \
 
 Notes:
 
-- Both scripts are intended for SDDE / solar-dynamo ENCA runs and rely on the saved hyperparameters from training.
-- `recon_test.py` checks that the supplied parameter values stay within the saved prior limits.
+- The ENCA scripts expect `representation_mode = "time"` and the MLP scripts expect `representation_mode = "fourier_amplitude"`. Missing `representation_mode` is treated as `"time"` by the ENCA tools for backward compatibility with older ENCA runs.
+- `recon_test_enca.py` and `recon_test_mlp.py` check that the supplied parameter values stay within the saved prior limits.
 - As with SDDE training, Julia must be available because both scripts initialize `juliacall` before importing TensorFlow.
 
 ## Julia Requirement
 
-The SDDE training scripts (`train_ENCA_model3.py` and `train_INCA_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
+The SDDE training scripts (`train_ENCA_model3.py` and `train_MLP_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
 
 If you only need the original model 1 and model 2 experiments, the Julia dependency is not required.
 
@@ -326,7 +378,7 @@ Please report any issues if you come across bugs or platform-specific dependency
 
 ## Note
 
-For the solar-dynamo / SDDE setting, the currently supported workflow in this repository is the ENCA model. An INCA model for the SDDE case has not been implemented as part of the maintained workflow at this stage. That may be added in the future, but there is no firm commitment yet.
+For the solar-dynamo / SDDE setting, the currently supported workflows in this repository are the time-domain ENCA model and the Fourier-amplitude MLP autoencoder. An INCA model for the SDDE case has not been implemented as part of the maintained workflow at this stage. That may be added in the future, but there is no firm commitment yet.
 
 ## Citation  
 

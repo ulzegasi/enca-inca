@@ -1,7 +1,7 @@
 #Author: Simone Ulzega, February 2026, simone.ulzega@zhaw.ch
 ################
-# This training pipeline has an encoder-decoder-like architecture. From input timeseries to sufficient statistics space, then
-# using the noise vectors back to the reconstruction of the initial input signal.
+# This training pipeline uses an MLP autoencoder on Hann-windowed log FFT
+# amplitudes of solar-dynamo / SDDE time series.
 
 # IMPORTANT: init_julia() must happen before importing tensorflow, 
 # otherwise there will be a conflict in the shared libraries used by both.
@@ -52,10 +52,16 @@ import src.utils_tf
 ##################################################################################################
 class Architecture:
     ''' Use this class to customize the architecture to be used. 
-    This example uses a fully convolutional encoder and a Bidirectional-LSTM-based decoder.'''
-    def __init__(self, ndims_latent, len_timeseries, num_noise_channels):
+    This example uses dense fully connected encoder and decoder networks.'''
+    def __init__(self, ndims_latent, len_timeseries, num_noise_channels, representation_mode="fourier_amplitude", num_fft_components=None):
+        if representation_mode != "fourier_amplitude":
+            raise ValueError("train_MLP_model3.py only supports representation_mode='fourier_amplitude'.")
+        if num_fft_components is None:
+            raise ValueError("num_fft_components is required for train_MLP_model3.py.")
         self.ndims_latent = ndims_latent
         self.len_timeseries = len_timeseries
+        self.representation_mode = representation_mode
+        self.num_fft_components = num_fft_components
         self.num_input_channels = 1 #assuming a given observed timeseries is a single channel (vector)
         self.num_noise_channels = num_noise_channels
 
@@ -63,36 +69,23 @@ class Architecture:
         self.decoder = self.decoder_fn()
 
     def encoder_fn(self):
-        '''x_input size: [bs, #len_timeseries, #num_input_channels] 
-        Implements encoder of only convolutional and maxpooling operators'''
-        conv_fn = lambda filters, act=None, name=None: tf.keras.layers.Conv1D(filters=filters, kernel_size=3, activation=act, name=name)
-        x_input = tf.keras.layers.Input(shape=[self.len_timeseries, self.num_input_channels], name='x_observation')
-        x = x_input
-        self.num_conv_filters = [[16, 16], [32, 32]]
-        for i in range(len(self.num_conv_filters)):
-            if i != 0:
-                x = tf.keras.layers.MaxPool1D(pool_size=2, name='maxpool%d'%(i+1))(x)
-            for j in range(len(self.num_conv_filters[i])):
-                x = conv_fn(filters=self.num_conv_filters[i][j], act='relu', name='conv%d_%d'%((i+1), (j+1)))(x) #[batch_size, len_timeseries, num_conv_filters[-1]]
-        x = conv_fn(filters=self.ndims_latent, act=None, name='final_conv')(x)  # [batch_size, len_timeseries, ndims_latent]
-        latent_space = tf.keras.layers.GlobalAveragePooling1D(name='global_avg_pool')(x)
+        '''x_input size: [bs, #num_fft_components]'''
+        x_input = tf.keras.layers.Input(shape=[self.num_fft_components], name='fft_amplitudes')
+        x = tf.keras.layers.Dense(256, activation='relu', name='enc_dense_1')(x_input)
+        x = tf.keras.layers.Dense(256, activation='relu', name='enc_dense_2')(x)
+        x = tf.keras.layers.Dense(128, activation='relu', name='enc_dense_3')(x)
+        latent_space = tf.keras.layers.Dense(self.ndims_latent, activation=None, name='latent_space')(x)
         return tf.keras.Model(inputs=x_input, outputs=latent_space)
 
     def decoder_fn(self):
         '''latent_mappings size: [bs, #ndims_latent]
-        noise_vectors size: [bs, #len_timeseries, #num_noise_channels]
-        output: [bs, #len_timeseries, #input_channels]'''
-        # tile latent_mappings to timeseries length of the noise vectors.
+        output: [bs, #num_fft_components]'''
         latent_mappings = tf.keras.layers.Input(shape=[self.ndims_latent], name='latent_representations')
-        noise_vectors = tf.keras.layers.Input(shape=[self.len_timeseries, self.num_noise_channels], name='noise_vectors')
-        tile_ldims_layer = tf.keras.layers.Lambda(function=lambda x: tf.tile(tf.expand_dims(x, axis=1), multiples=[1, self.len_timeseries, 1]), name='tile_latent_space') 
-        concat_inputs = tf.keras.layers.Concatenate(axis=-1, name='concatenate_noise_and_latent_dims')([tile_ldims_layer(latent_mappings), noise_vectors])
-        num_units = 16
-        x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(units=num_units, return_sequences=True, dtype=tf.float32, name='lstm_cell_1'), name='Bi-cell-1')(concat_inputs)
-        x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(units=num_units, return_sequences=True, dtype=tf.float32, name='lstm_cell_2'), name='Bi-cell-2')(x)
-        x = tf.keras.layers.Dense(units=self.num_input_channels, activation=None, name='pred')(x)
-        x = tf.keras.layers.Reshape([self.len_timeseries, self.num_input_channels], name='output_shape')(x)
-        return tf.keras.Model(inputs=(latent_mappings, noise_vectors), outputs=x)
+        x = tf.keras.layers.Dense(128, activation='relu', name='dec_dense_1')(latent_mappings)
+        x = tf.keras.layers.Dense(256, activation='relu', name='dec_dense_2')(x)
+        x = tf.keras.layers.Dense(256, activation='relu', name='dec_dense_3')(x)
+        x = tf.keras.layers.Dense(self.num_fft_components, activation=None, name='pred_fft_amplitudes')(x)
+        return tf.keras.Model(inputs=latent_mappings, outputs=x)
 
 ##################################################################################################
 class Args_:
@@ -224,15 +217,17 @@ class ExpSetup:
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_logdir = os.path.join(
             os.getcwd(),
-            "sdde_ENCA_runs",
+            "sdde_MLP_runs",
             f"{run_id}_{tag}"
         )
-        self.logdir = os.environ.get("ENCA_LOGDIR", default_logdir)
+        self.logdir = os.environ.get("MLP_LOGDIR", default_logdir)
 
-        self.ndims_latent = 10
+        self.ndims_latent = 6
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
-        self.representation_mode = "time"
+        self.representation_mode = "fourier_amplitude"
+        self.num_fft_components = 100
+        self.fft_log_eps = 1e-8
 
         # SDDE sim settings
         self.Twarmup = 200
@@ -258,7 +253,7 @@ class ExpSetup:
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
         
-        """ # parameter priors
+        # parameter priors
         self.tau_lims = (0.1, 10.0)
         self.T_lims = (0.1, 10.0)
         self.Nd_lims = (1.0, 15.0)
@@ -267,8 +262,9 @@ class ExpSetup:
         # Try something different:
         self.sigma_lims = (0.005, 0.05)
         # --------------------------------------------------------
-        self.Bmax_lims = (1.0, 15.0) """
+        self.Bmax_lims = (1.0, 15.0)
         
+        """
         # parameter priors for "easy training"
         self.tau_lims = (4.0, 10.0)
         self.T_lims = (4.0, 10.0)
@@ -276,6 +272,7 @@ class ExpSetup:
         self.sigma_lims = (0.005, 0.05)
         # --------------------------------------------------------
         self.Bmax_lims = (4.0, 15.0)
+        """
         
 ##################################################################################################
 def main():
@@ -306,6 +303,18 @@ def main():
         Bmax_lims=args.Bmax_lims,
     )
     
+    @tf.function
+    def timeseries_to_fft_log_amplitudes(x):
+        """Map [batch, time, 1] signals to log normalized FFT amplitudes [batch, n_fft]."""
+        x_1d = tf.squeeze(x, axis=-1)
+        n_time = tf.shape(x_1d)[1]
+        window = tf.signal.hann_window(n_time, periodic=False, dtype=x_1d.dtype)
+        x_windowed = x_1d * window[tf.newaxis, :]
+        spectrum = tf.signal.fft(tf.cast(x_windowed, tf.complex64))
+        amplitudes = tf.abs(spectrum) / tf.cast(n_time, x_1d.dtype)
+        amplitudes = amplitudes[:, :args.num_fft_components]
+        return tf.math.log(amplitudes + tf.constant(args.fft_log_eps, dtype=amplitudes.dtype))
+
     def next_batch_from_generator(gen, batch_size):
         """Collect batch_size samples from the Python generator (main thread)."""
         xs = []
@@ -323,14 +332,21 @@ def main():
         n_np = np.stack(ns, axis=0).astype(np.float32)      # (B, len, nc)
 
         # Convert to TF tensors
-        x = tf.convert_to_tensor(x_np)
+        x_raw = tf.convert_to_tensor(x_np)
         params = tf.convert_to_tensor(p_np)
         noise = tf.convert_to_tensor(n_np)
+        x = timeseries_to_fft_log_amplitudes(x_raw)
         return x, params, noise
 
     ##################################################################################################
     # Define the architecture
-    model_obj = Architecture(ndims_latent=args.ndims_latent, len_timeseries=args.len_timeseries, num_noise_channels=args.num_noise_channels)
+    model_obj = Architecture(
+        ndims_latent=args.ndims_latent,
+        len_timeseries=args.len_timeseries,
+        num_noise_channels=args.num_noise_channels,
+        representation_mode=args.representation_mode,
+        num_fft_components=args.num_fft_components,
+    )
     model_obj.encoder.summary()
     model_obj.decoder.summary()
 
@@ -384,10 +400,21 @@ def main():
     def loss_reconstruction_fn_balanced(x, x_pred, return_each_dim=False):
         """
         Per-sample normalized MSE:
-          1. compute one RMS amplitude scale per sample and channel
+          1. compute one RMS amplitude scale per sample
           2. normalize reconstruction error by that scale
-          3. average over time, then over batch
+          3. average over observation dimensions, then over batch
         """
+        if x.shape.rank == 2:
+            rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
+            rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
+            sq_error = tf.square((x - x_pred) / rms_scale)
+            per_sample = tf.reduce_mean(sq_error, axis=1)  # [batch]
+
+            if return_each_dim:
+                return {'NormMSE_observation': tf.reduce_mean(per_sample)}
+
+            return tf.reduce_mean(per_sample)
+
         rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
         rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
         sq_error = tf.square((x - x_pred) / rms_scale)
@@ -481,7 +508,7 @@ def main():
         """Single training step (no logging inside)."""
         with tf.GradientTape(persistent=False) as tape:
             z_latent = model.encoder(x, training=True)
-            x_reconst = model.decoder((z_latent, noise), training=True)
+            x_reconst = model.decoder(z_latent, training=True)
 
             if args.loss_mode == "legacy_chisq":
                 dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
@@ -604,15 +631,14 @@ def main():
             dict_avg_loss_reg_p_items[k].update_state(dict_reg[k])
 
         # RMSE reconstruction
-        for i_ in range(x.shape[-1]):
-            k = f'RMSE_x_ch_{i_+1}'
-            if k not in dict_avg_rmse_recon_items:
-                dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
-                    name='rmse_reconstruction', dtype=tf.float32
-                )
-            dict_avg_rmse_recon_items[k].update_state(
-                y_true=x[..., i_], y_pred=x_reconst[..., i_]
+        k = 'RMSE_observation'
+        if k not in dict_avg_rmse_recon_items:
+            dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                name='rmse_reconstruction', dtype=tf.float32
             )
+        dict_avg_rmse_recon_items[k].update_state(
+            y_true=x, y_pred=x_reconst
+        )
 
         # RMSE regression
         for i_ in range(params.shape[-1]):
@@ -753,6 +779,16 @@ class Sampler:
         self.generator = generator
         self.iterator = iterator
 
+    def timeseries_to_fft_log_amplitudes_np(self, x):
+        x_arr = np.asarray(x, dtype=np.float32)
+        if x_arr.ndim == 2:
+            x_arr = x_arr[np.newaxis, ...]
+        x_1d = np.squeeze(x_arr, axis=-1)
+        n_time = x_1d.shape[1]
+        window = np.hanning(n_time).astype(np.float32)
+        amplitudes = np.abs(np.fft.fft(x_1d * window[None, :], axis=1)) / float(n_time)
+        return np.log(amplitudes[:, :self.args.num_fft_components] + self.args.fft_log_eps).astype(np.float32)
+
     def sample(self, num_samples=10, return_noise_vectors=False, params=None):
         '''Function samples #num_samples observed vectors, then returns the mapped representation for each (size: [#num_samples, #stats]).
         if params is not None, existing generator is ignored and a new custom one is initialized.'''
@@ -768,6 +804,7 @@ class Sampler:
         for i in range(num_samples):
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32) #creating minibatch size 1.
+            x_i = self.timeseries_to_fft_log_amplitudes_np(x_i)
             noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
             o_latent = self.model_obj.encoder(x_i, training=False).numpy()
             summary_space[i,...] = o_latent
@@ -780,6 +817,8 @@ class Sampler:
     def encode(self, samples):
         '''Function generates latent representations of the given observations (samples).
         samples should be of shape: [num_samples, len_timeseries, num_channels=1]'''
+        if samples.ndim == 3:
+            samples = self.timeseries_to_fft_log_amplitudes_np(samples)
         o_latent = self.model_obj.encoder(samples)
         return o_latent
 
@@ -792,22 +831,20 @@ class Sampler:
             iterator = self.iterator 
         else:
             _, iterator = self.build_custom_generator(return_generator=True, **params)
-        ndarray_timeseries = np.zeros((num_samples, self.args.len_timeseries))
+        ndarray_timeseries = np.zeros((num_samples, self.args.num_fft_components))
         for i in range(num_samples):
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32) #creating minibatch size 1.
-            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
+            x_i = self.timeseries_to_fft_log_amplitudes_np(x_i)
             z_latent = self.model_obj.encoder(x_i, training=False)
-            o_reconst = self.model_obj.decoder((z_latent, noise_i), training=False).numpy()
+            o_reconst = self.model_obj.decoder(z_latent, training=False).numpy()
             ndarray_timeseries[i,...] = np.squeeze(o_reconst)
         return ndarray_timeseries
 
     def decode(self, tuple_summary_and_noise):
         '''Function reconstruct timeseries for a given tuple of (latent_representations, noise vectors).'''
         o_latent = tuple_summary_and_noise[0]
-        noise_i = tuple_summary_and_noise[1]
-        o_reconst = self.model_obj.decoder((o_latent, noise_i), training=False).numpy()
-        return o_reconst
+        return self.model_obj.decoder(o_latent, training=False).numpy()
 
     def check_hyper_params(self):
         hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
@@ -822,7 +859,13 @@ class Sampler:
                         raise AssertionError('Mismatch of hyper-parameter attributes in the logdir %s and ExpSetup file in this script for attribute: %s' % (self.args.logdir, attr))
 
     def build_model(self):
-        self.model_obj = Architecture(ndims_latent=self.args.ndims_latent, len_timeseries=self.args.len_timeseries, num_noise_channels=self.args.num_noise_channels)
+        self.model_obj = Architecture(
+            ndims_latent=self.args.ndims_latent,
+            len_timeseries=self.args.len_timeseries,
+            num_noise_channels=self.args.num_noise_channels,
+            representation_mode=self.args.representation_mode,
+            num_fft_components=self.args.num_fft_components,
+        )
 
     def load_model(self, basename='model_best_ckpt'):
         ckpt = tf.train.Checkpoint(encoder=self.model_obj.encoder, decoder=self.model_obj.decoder)
