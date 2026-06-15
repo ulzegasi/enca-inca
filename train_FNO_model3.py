@@ -336,9 +336,9 @@ class ExpSetup:
         self.architecture_name = "fno_enca"
 
         # FNO architecture settings
-        self.fno_width = 64
-        self.fno_modes = 32
-        self.fno_layers = 4
+        self.fno_width = int(os.environ.get("FNO_WIDTH", "64"))
+        self.fno_modes = int(os.environ.get("FNO_MODES", "32"))
+        self.fno_layers = int(os.environ.get("FNO_LAYERS", "4"))
         self.use_time_coordinate = True
 
         # SDDE sim settings
