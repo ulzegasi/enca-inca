@@ -1,6 +1,7 @@
 
 sdde_ENCA_runs/
 sdde_MLP_runs/
+sdde_FNO_runs/
 txtout/
 Slurm-*/
 julia_env/.CondaPkg/
