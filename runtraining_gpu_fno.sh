@@ -34,17 +34,10 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs
 
-# ==============================
-# Editable variables
-# ==============================
-FNO_WIDTH="${FNO_WIDTH:-64}"
-FNO_MODES="${FNO_MODES:-32}"
-FNO_LAYERS="${FNO_LAYERS:-4}"
-
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260615.
 RUNSTAMP=$(date +%Y%m%d)
-export FNO_LOGDIR="${FNO_LOGDIR:-/cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs/${RUNSTAMP}_fno_z10_m${FNO_MODES}_1}"
+export FNO_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs/${RUNSTAMP}_fno_z10_m32_1
 mkdir -p "$FNO_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
@@ -66,12 +59,9 @@ echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "FNO_LOGDIR=$FNO_LOGDIR"
-echo "FNO_WIDTH=$FNO_WIDTH"
-echo "FNO_MODES=$FNO_MODES"
-echo "FNO_LAYERS=$FNO_LAYERS"
 nvidia-smi || true
 
 # ==============================
 # Run
 # ==============================
-srun --export=ALL,FNO_LOGDIR="$FNO_LOGDIR",FNO_WIDTH="$FNO_WIDTH",FNO_MODES="$FNO_MODES",FNO_LAYERS="$FNO_LAYERS" --cpu-bind=cores python train_FNO_model3.py
+srun --export=ALL,FNO_LOGDIR="$FNO_LOGDIR" --cpu-bind=cores python train_FNO_model3.py
