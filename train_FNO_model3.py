@@ -329,7 +329,7 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("FNO_LOGDIR", default_logdir)
 
-        self.ndims_latent = 20
+        self.ndims_latent = 10
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
         self.representation_mode = "time"
@@ -361,9 +361,15 @@ class ExpSetup:
         # "legacy_chisq" reproduces the original implementation.
         # "balanced_mse" uses normalized MSEs with comparable reductions.
         self.loss_mode = "balanced_mse"
-        self.lambda_recon = 3.0
+        self.lambda_recon = 1.0
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
+
+        # Optimizer schedule (stored with the run hyperparameters).
+        self.initial_learning_rate = 1.e-3
+        self.lr_decay_steps = int(12e3)
+        self.lr_decay_rate = 0.92
+        self.lr_staircase = True
         
         # parameter priors
         self.tau_lims = (0.1, 10.0)
@@ -540,7 +546,12 @@ def main():
     # --- Custom LR schedule: linear warmup from ~0 to your initial LR, then exponential decay ---
     # lr_schedule = src.utils_tf.LearningRateScheduleExponentialDecayWithLinearWarmup(steps_warmup=args.linear_warmup_steps, initial_learning_rate=1.e-3, decay_steps=int(6*1e3), decay_rate=0.92, staircase=True)
     # --- Exponential decay with fixed initial LR ---
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1.e-3, decay_steps=int(3e4), decay_rate=0.92, staircase=True)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=args.initial_learning_rate,
+        decay_steps=args.lr_decay_steps,
+        decay_rate=args.lr_decay_rate,
+        staircase=args.lr_staircase,
+    )
     # --- Optimizer --- 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule) 
     #, clipnorm=1e5, clipvalue=1.) 
