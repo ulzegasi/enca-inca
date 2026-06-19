@@ -354,6 +354,120 @@ Notes:
 - `recon_test_enca.py` and `recon_test_mlp.py` check that the supplied parameter values stay within the saved prior limits.
 - As with SDDE training, Julia must be available because both scripts initialize `juliacall` before importing TensorFlow.
 
+## MLP Prior Distribution In Latent Space
+
+[`prior_dist_latent_variables.py`](prior_dist_latent_variables.py) visualizes how simulated observations drawn from the parameter prior are distributed in the six-dimensional latent space of a trained Fourier-amplitude MLP. For every prior draw, the script:
+
+1. samples `(tau, T, Nd, sigma, Bmax)` using the limits in the run's `hyper_parameters.json`;
+2. simulates an SDDE observation;
+3. applies the same Hann-windowed log FFT-amplitude transformation used during training; and
+4. passes the transformed observation through the restored encoder to obtain `(z1, ..., z6)`.
+
+The first five latent coordinates are the supervised parameter estimates. The sixth coordinate is the free, non-interpretable latent statistic. The generated overview therefore shows all ten three-dimensional combinations `(z_i, z_j, z6)` with `1 <= i < j <= 5`. In each PNG panel, a translucent blue prism marks the two displayed parameter priors and extends through the observed `z6` range. Points outside either displayed prior are colored red, and the axes expand to keep those outliers visible. Parameter `T` is sampled on the `dt` grid, as required by the SDDE simulator; the other parameters are sampled continuously and uniformly within their saved limits.
+
+The default model is `20260611_mlp_z6_1`, with 1000 prior samples and seed 1234:
+
+```bash
+python prior_dist_latent_variables.py
+```
+
+A bare model name is looked up under `sdde_MLP_runs/`. A full or relative run-directory path can also be supplied:
+
+```bash
+# 2000 samples from the default run, with a reproducible custom seed
+python prior_dist_latent_variables.py 20260611_mlp_z6_1 \
+  --nsamples 2000 \
+  --seed 42
+
+# equivalently, pass the run directory
+python prior_dist_latent_variables.py \
+  sdde_MLP_runs/20260611_mlp_z6_1 \
+  --nsamples 2000
+
+# use the latest regular checkpoint instead of the latest best checkpoint
+python prior_dist_latent_variables.py 20260611_mlp_z6_1 --last
+
+# also save a rotatable, zoomable HTML version of all ten plots
+python prior_dist_latent_variables.py 20260611_mlp_z6_1 --interactive
+
+# encode the observed SILSO sunspot record and mark it in both plot types
+python prior_dist_latent_variables.py 20260611_mlp_z6_1 \
+  --obs-sn-data /path/to/silso_SN_y_202601.csv \
+  --interactive
+```
+
+CLI options:
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `model` | no | `20260611_mlp_z6_1` | Bare run name or path to an MLP run directory. |
+| `--nsamples <int>` | no | `1000` | Number of prior observations to simulate and encode. |
+| `--seed <int>` | no | `1234` | Seed controlling the parameter draws and driving noise. |
+| `--batch <int>` | no | `128` | Batch size for encoder inference. |
+| `--outdir <path>` | no | `<run>/diagnostics/prior_latent` | Directory for the plot and numerical output. |
+| `--dpi <int>` | no | `180` | Resolution of the saved PNG. |
+| `--interactive` | no | disabled | Also save a self-contained interactive Plotly HTML overview. |
+| `--obs-sn-data <path>` | no | disabled | Encode the full two-column SILSO yearly CSV using the SDDEpy `[49:-6]` crop and mark obsSN in the plots. |
+| `--best` | no | enabled by default | Use the latest `model_best_ckpt-*` checkpoint. Mutually exclusive with `--last`. |
+| `--last` | no | disabled | Use the latest regular `model_ckpt-*` checkpoint. Mutually exclusive with `--best`. |
+
+Each run writes a PNG and an NPZ file whose names record the checkpoint step, number of samples, and seed:
+
+```text
+prior_latent_model_best_ckpt_step550000_n1000_seed1234_z6_triplets.png
+prior_latent_model_best_ckpt_step550000_n1000_seed1234.npz
+```
+
+The PNG contains the ten 3D latent-space panels. The compressed NumPy file preserves the underlying values, allowing further analysis without rerunning the simulator. Load it with:
+
+With `--interactive`, the script additionally writes:
+
+```text
+prior_latent_model_best_ckpt_step550000_n1000_seed1234_z6_triplets_interactive.html
+```
+
+Open this self-contained HTML file in a web browser to rotate, pan, and zoom each 3D panel. The interactive plots omit the prior prism for a cleaner view and render the prior cloud with low opacity, while outliers remain red. Hovering over a point shows all six latent coordinates and its five sampled physical parameters. The Plotly toolbar can also reset the camera or save the current view as an image.
+
+When `--obs-sn-data` is supplied, the script follows the obsSN loader in SDDEpy and selects `data[49:-6]` from the full SILSO file. For `silso_SN_y_202601.csv`, this produces the 271 yearly values from 1749.5 through 2019.5 expected by the model. The encoded observation is shown above the translucent prior-sample cloud as a large magenta star in the PNG and as a magenta diamond labelled `obsSN` in the interactive HTML. Its numerical inputs and latent coordinates are also added to the NPZ as `observed_years`, `observed_values`, `observed_latent`, and `observed_data_path`.
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+output_dir = Path(
+    "sdde_MLP_runs/20260611_mlp_z6_1/diagnostics/prior_latent"
+)
+npz_path = sorted(output_dir.glob("prior_latent_*.npz"))[-1]
+
+with np.load(npz_path, allow_pickle=False) as data:
+    parameters = data["parameters"]       # shape: (nsamples, 5)
+    latent = data["latent"]               # shape: (nsamples, 6)
+    parameter_names = data["parameter_names"]
+    checkpoint = str(data["checkpoint"])
+    seed = int(data["seed"])
+    observed_latent = data.get("observed_latent")  # present with --obs-sn-data
+
+tau, T, Nd, sigma, Bmax = parameters.T
+z1, z2, z3, z4, z5, z6 = latent.T
+
+print(parameter_names)
+print(checkpoint, seed)
+```
+
+For example, a new 3D projection can be made directly from the saved arrays:
+
+```python
+import matplotlib.pyplot as plt
+
+fig = plt.figure()
+ax = fig.add_subplot(projection="3d")
+points = ax.scatter(z1, z3, z6, c=z6, s=8, alpha=0.6)
+ax.set(xlabel="z1 (tau)", ylabel="z3 (Nd)", zlabel="z6 (free)")
+fig.colorbar(points, ax=ax, label="z6")
+fig.savefig("z1_z3_z6.png", dpi=180, bbox_inches="tight")
+```
+
 ## Julia Requirement
 
 The SDDE training scripts (`train_ENCA_model3.py` and `train_MLP_model3.py`) initialize Julia via `juliacall` before importing TensorFlow. To run these scripts successfully, make sure Julia is installed and available on your system. On first use, `juliacall` may also download or initialize Julia-related components.
