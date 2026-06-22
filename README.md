@@ -13,6 +13,7 @@ The repository contains the code needed to train the proposed models _explicit n
 - `train_ENCA_model2.py`, `train_INCA_model2.py`: original model 2 experiments
 - `train_ENCA_model3.py`: solar-dynamo / SDDE ENCA experiments using the Julia-backed simulator
 - `train_MLP_model3.py`: solar-dynamo / SDDE MLP experiments on Fourier-amplitude representations
+- `train_FNO_model3.py`: solar-dynamo / SDDE FNO experiments with configurable time- or Fourier-domain reconstruction loss
 
 Supporting code lives in `src/`. Local solar-dynamo training outputs are written to `sdde_ENCA_runs/` for ENCA and `sdde_MLP_runs/` for MLP.
 
@@ -40,6 +41,7 @@ For the solar-dynamo / SDDE experiments, use:
 ```bash
 python train_ENCA_model3.py
 python train_MLP_model3.py
+python train_FNO_model3.py
 ```
 
 Before launching one of these training scripts, manually review the `ExpSetup` class in the script you are running and set the key run parameters there. In particular:
@@ -79,6 +81,29 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 - default output directory: `sdde_MLP_runs/`
 - logdir override: `MLP_LOGDIR=/path/to/run`
 - cluster launchers: `runtraining_cpu_mlp.sh`, `runtraining_gpu_mlp.sh`
+
+### FNO
+
+`train_FNO_model3.py` always feeds the original time-domain signal to the encoder
+and always makes the decoder produce a time-domain signal. The reconstruction
+objective is selected independently with `FNO_RECON_DOMAIN`:
+
+- `time` (default): compare the true and reconstructed time series
+- `fourier_log_amplitude`: apply the same Hann-windowed, normalized log-FFT
+  transform as the MLP and compare the first 100 amplitude components
+
+Start a fresh spectral-loss run with an explicit run directory:
+
+```bash
+FNO_RECON_DOMAIN=fourier_log_amplitude \
+FNO_LOGDIR=sdde_FNO_runs/<new_spectral_run> \
+python train_FNO_model3.py
+```
+
+The selected domain, `num_fft_components = 100`, and `fft_log_eps = 1e-8` are
+saved in `hyper_parameters.json`. Older FNO runs without a saved domain are
+treated as time-domain runs. The default FNO learning-rate schedule uses
+`lr_decay_steps = 12000`.
 
 ## SDDE Loss Configuration
 
@@ -276,6 +301,23 @@ python recon_test_mlp.py \
   --sigma 0.12 \
   --Bmax 10.0
 ```
+
+For FNO runs:
+
+```bash
+python diag_test_fno.py --logdir sdde_FNO_runs/<run_name>
+python recon_test_fno.py \
+  --logdir sdde_FNO_runs/<run_name> \
+  --tau 2.0 \
+  --T 3.0 \
+  --Nd 8.0 \
+  --sigma 0.02 \
+  --Bmax 10.0
+```
+
+`recon_test_fno.py` reads the saved reconstruction domain automatically. It
+plots and scores time-domain trajectories for legacy/time runs and log-FFT
+amplitudes for spectral-loss runs.
 
 The diagonal tests evaluate how well the encoder recovers the physical parameters from synthetic samples and write a plot into `<run>/diagnostics/`.
 

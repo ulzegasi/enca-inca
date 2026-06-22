@@ -260,6 +260,9 @@ class Manage_Hyper_Parameters:
                 continue
 
             if not hasattr(self.args, k):
+                if k == "reconstruction_loss_domain" and getattr(args, k) != "time":
+                    mismatches.append((k, "time (legacy default)", getattr(args, k)))
+                    continue
                 print(f'WARNING: key "{k}" was missing in the saved hyper-parameter configuration; will renew file.')
                 save_args = True
                 continue
@@ -270,9 +273,6 @@ class Manage_Hyper_Parameters:
             if not _equal(old_v, new_v):
                 mismatches.append((k, old_v, new_v))
 
-        if save_args:
-            self.save_parameters(args)
-
         if mismatches:
             # Print all mismatches, then stop.
             for k, old_v, new_v in mismatches:
@@ -281,6 +281,9 @@ class Manage_Hyper_Parameters:
                 f"Hyper-parameter mismatch detected ({len(mismatches)} keys). "
                 "Either restore the old settings or start a new logdir."
             )
+
+        if save_args:
+            self.save_parameters(args)
 
         return None
     def save_parameters(self, args):
@@ -329,7 +332,7 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("FNO_LOGDIR", default_logdir)
 
-        self.ndims_latent = 10
+        self.ndims_latent = 6
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
         self.representation_mode = "time"
@@ -364,6 +367,26 @@ class ExpSetup:
         self.lambda_recon = 1.0
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
+        self.reconstruction_loss_domain = os.environ.get("FNO_RECON_DOMAIN", "time")
+        self.num_fft_components = 100
+        self.fft_log_eps = 1e-8
+        valid_recon_domains = ("time", "fourier_log_amplitude")
+        if self.reconstruction_loss_domain not in valid_recon_domains:
+            raise ValueError(
+                f"FNO_RECON_DOMAIN must be one of {valid_recon_domains}, "
+                f"got {self.reconstruction_loss_domain!r}."
+            )
+        if self.reconstruction_loss_domain == "fourier_log_amplitude":
+            max_unique_fft_components = self.len_timeseries // 2 + 1
+            if not (1 <= self.num_fft_components <= max_unique_fft_components):
+                raise ValueError(
+                    f"num_fft_components must be in [1, {max_unique_fft_components}], "
+                    f"got {self.num_fft_components}."
+                )
+            if self.loss_mode != "balanced_mse":
+                raise ValueError(
+                    "fourier_log_amplitude reconstruction currently requires loss_mode='balanced_mse'."
+                )
 
         # Optimizer schedule (stored with the run hyperparameters).
         self.initial_learning_rate = 1.e-3
@@ -440,6 +463,20 @@ def main():
         noise = tf.convert_to_tensor(n_np)
         return x, params, noise
 
+    @tf.function
+    def timeseries_to_fft_log_amplitudes(x):
+        """Map [batch, time, 1] signals to Hann-windowed log FFT amplitudes."""
+        x_1d = tf.squeeze(x, axis=-1)
+        n_time = tf.shape(x_1d)[1]
+        window = tf.signal.hann_window(n_time, periodic=False, dtype=x_1d.dtype)
+        x_windowed = x_1d * window[tf.newaxis, :]
+        spectrum = tf.signal.fft(tf.cast(x_windowed, tf.complex64))
+        amplitudes = tf.abs(spectrum) / tf.cast(n_time, x_1d.dtype)
+        amplitudes = amplitudes[:, :args.num_fft_components]
+        return tf.math.log(
+            amplitudes + tf.constant(args.fft_log_eps, dtype=amplitudes.dtype)
+        )
+
     ##################################################################################################
     # Define the architecture
     model_obj = Architecture(
@@ -508,6 +545,17 @@ def main():
           2. normalize reconstruction error by that scale
           3. average over time, then over batch
         """
+        if x.shape.rank == 2:
+            rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
+            rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
+            sq_error = tf.square((x - x_pred) / rms_scale)
+            per_sample = tf.reduce_mean(sq_error, axis=1)  # [batch]
+
+            if return_each_dim:
+                return {'NormMSE_observation': tf.reduce_mean(per_sample)}
+
+            return tf.reduce_mean(per_sample)
+
         rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
         rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
         sq_error = tf.square((x - x_pred) / rms_scale)
@@ -608,14 +656,24 @@ def main():
             z_latent = model.encoder(x, training=True)
             x_reconst = model.decoder((z_latent, noise), training=True)
 
+            x_reconstruction_target = x
+            x_reconstruction_pred = x_reconst
+            if args.reconstruction_loss_domain == "fourier_log_amplitude":
+                x_reconstruction_target = timeseries_to_fft_log_amplitudes(x)
+                x_reconstruction_pred = timeseries_to_fft_log_amplitudes(x_reconst)
+
             if args.loss_mode == "legacy_chisq":
-                dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
+                dict_reconstruction = loss_reconstruction_fn_legacy(
+                    x_reconstruction_target, x_reconstruction_pred, return_each_dim=True
+                )
                 loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
 
                 dict_regression = loss_regress_params_fn_legacy(params, z_latent, return_each_dim=True)
                 loss_regress_params = tf.reduce_sum(list(dict_regression.values()))
             elif args.loss_mode == "balanced_mse":
-                dict_reconstruction = loss_reconstruction_fn_balanced(x, x_reconst, return_each_dim=True)
+                dict_reconstruction = loss_reconstruction_fn_balanced(
+                    x_reconstruction_target, x_reconstruction_pred, return_each_dim=True
+                )
                 loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
 
                 dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
@@ -633,7 +691,11 @@ def main():
 
         optimizer.apply_gradients(zip(gradients, trainable_variables))
 
-        return (loss_reconstruction, loss_regress_params, loss), (z_latent, x_reconst), (dict_reconstruction, dict_regression)
+        return (
+            (loss_reconstruction, loss_regress_params, loss),
+            (z_latent, x_reconst, x_reconstruction_target, x_reconstruction_pred),
+            (dict_reconstruction, dict_regression),
+        )
     ##################################################################################################
     # Define a few metrics to export to tensorboard
     avg_loss_total = tf.keras.metrics.Mean(name='loss_total', dtype=tf.float32) # variable will keep track of average of loss value since last freq_log
@@ -681,7 +743,10 @@ def main():
         f"width={args.fno_width}, modes={args.fno_modes}, "
         f"layers={args.fno_layers}, use_time_coordinate={args.use_time_coordinate}"
     )
-    print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
+    print(
+        f"loss mode: {args.loss_mode}, reconstruction domain: {args.reconstruction_loss_domain} "
+        f"(lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})"
+    )
 
     # --- warm up tf.function tracing/compilation ---
     print("Warming up train_step (tf.function tracing/compilation)...")
@@ -702,7 +767,7 @@ def main():
         )
 
         # unpack
-        z_latent, x_reconst = z_and_x
+        z_latent, x_reconst, x_reconstruction_target, x_reconstruction_pred = z_and_x
         loss_reconstruction, loss_regress_params, loss_total = loss_tuple
         dict_rec, dict_reg = dict_mse
 
@@ -733,16 +798,26 @@ def main():
                 dict_avg_loss_reg_p_items[k] = tf.keras.metrics.Mean(name=k, dtype=tf.float32)
             dict_avg_loss_reg_p_items[k].update_state(dict_reg[k])
 
-        # RMSE reconstruction
-        for i_ in range(x.shape[-1]):
-            k = f'RMSE_x_ch_{i_+1}'
+        # RMSE in the same domain as the reconstruction objective.
+        if args.reconstruction_loss_domain == "fourier_log_amplitude":
+            k = 'RMSE_spectrum'
             if k not in dict_avg_rmse_recon_items:
                 dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
                     name='rmse_reconstruction', dtype=tf.float32
                 )
             dict_avg_rmse_recon_items[k].update_state(
-                y_true=x[..., i_], y_pred=x_reconst[..., i_]
+                y_true=x_reconstruction_target, y_pred=x_reconstruction_pred
             )
+        else:
+            for i_ in range(x.shape[-1]):
+                k = f'RMSE_x_ch_{i_+1}'
+                if k not in dict_avg_rmse_recon_items:
+                    dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                        name='rmse_reconstruction', dtype=tf.float32
+                    )
+                dict_avg_rmse_recon_items[k].update_state(
+                    y_true=x[..., i_], y_pred=x_reconst[..., i_]
+                )
 
         # RMSE regression
         for i_ in range(params.shape[-1]):
