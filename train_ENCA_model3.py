@@ -713,10 +713,13 @@ def main():
         if (step % (10 * args.freq_log) == 0) or reached_max_steps:
 
             current_long_loss = float(avg_loss_long_term.result().numpy())
+            # Compare independent fixed-length windows. Reset even when the
+            # current window is not a new best so a transient spike cannot
+            # contaminate every subsequent best-checkpoint comparison.
+            avg_loss_long_term.reset_state()
 
             if current_long_loss < curr_best_loss:
                 curr_best_loss = current_long_loss
-                avg_loss_long_term.reset_state()
 
                 logging.info(
                     'New long term best loss found: %.3f. Saving.' % curr_best_loss
