@@ -2,9 +2,10 @@
 """Sample the SDDE prior and visualize its encoded MLP latent distribution.
 
 The default plots contain every three-dimensional latent-space combination
-(z_i, z_j, z_6), i < j <= 5.  The sampled parameters and latent coordinates
-are also saved as a compressed NumPy archive so that plotting experiments do
-not require rerunning the SDDE simulator.
+(z_i, z_j, z_last), where z_last is the final latent dimension and i, j are
+earlier dimensions.  The sampled parameters and latent coordinates are also
+saved as a compressed NumPy archive so that plotting experiments do not require
+rerunning the SDDE simulator.
 """
 
 import argparse
@@ -40,7 +41,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Draw synthetic observations from a saved MLP run's parameter "
-            "priors, encode them, and plot all (z_i, z_j, z_6) triplets."
+            "priors, encode them, and plot all (z_i, z_j, z_last) triplets."
         )
     )
     parser.add_argument(
@@ -183,7 +184,7 @@ def latent_label(index: int) -> str:
 
 
 def add_prior_prism(ax, x_limits, y_limits, z_limits) -> None:
-    """Draw the prior rectangle as a translucent prism over the observed z6 range."""
+    """Draw the prior rectangle as a translucent prism over the z-axis range."""
     x_lo, x_hi = x_limits
     y_lo, y_hi = y_limits
     z_lo, z_hi = z_limits
@@ -216,7 +217,7 @@ def add_prior_prism(ax, x_limits, y_limits, z_limits) -> None:
     ax.add_collection3d(prism)
 
 
-def plot_z6_triplets(
+def plot_last_latent_triplets(
     z: np.ndarray,
     output_path: Path,
     *,
@@ -225,8 +226,10 @@ def plot_z6_triplets(
     title: str,
     dpi: int,
 ) -> None:
-    """Plot all ten (z_i, z_j, z_6) combinations in one overview."""
-    triplets = list(combinations(range(5), 2))
+    """Plot all (z_i, z_j, z_last) combinations in one overview."""
+    last_index = z.shape[1] - 1
+    last_label = f"z{last_index + 1}"
+    triplets = list(combinations(range(last_index), 2))
     ncols = 3
     nrows = int(np.ceil(len(triplets) / ncols))
     fig = plt.figure(figsize=(17, 18), constrained_layout=True)
@@ -235,13 +238,17 @@ def plot_z6_triplets(
         ncols + 1,
         width_ratios=[1.0] * ncols + [0.045],
     )
-    z6_values = z[:, 5] if observed_z is None else np.append(z[:, 5], observed_z[5])
-    z6_min = float(z6_values.min())
-    z6_max = float(z6_values.max())
-    if z6_min == z6_max:
-        z6_min -= 0.5
-        z6_max += 0.5
-    color_norm = plt.Normalize(vmin=z6_min, vmax=z6_max)
+    z_axis_values = (
+        z[:, last_index]
+        if observed_z is None
+        else np.append(z[:, last_index], observed_z[last_index])
+    )
+    z_axis_min = float(z_axis_values.min())
+    z_axis_max = float(z_axis_values.max())
+    if z_axis_min == z_axis_max:
+        z_axis_min -= 0.5
+        z_axis_max += 0.5
+    color_norm = plt.Normalize(vmin=z_axis_min, vmax=z_axis_max)
     color_mappable = plt.cm.ScalarMappable(norm=color_norm, cmap="viridis")
 
     for panel, (i, j) in enumerate(triplets, start=1):
@@ -261,8 +268,8 @@ def plot_z6_triplets(
             ax.scatter(
                 z[in_prior, i],
                 z[in_prior, j],
-                z[in_prior, 5],
-                c=z[in_prior, 5],
+                z[in_prior, last_index],
+                c=z[in_prior, last_index],
                 cmap="viridis",
                 norm=color_norm,
                 s=8,
@@ -275,7 +282,7 @@ def plot_z6_triplets(
             ax.scatter(
                 z[~in_prior, i],
                 z[~in_prior, j],
-                z[~in_prior, 5],
+                z[~in_prior, last_index],
                 c="red",
                 s=13,
                 alpha=0.8,
@@ -286,12 +293,12 @@ def plot_z6_triplets(
             )
             ax.legend(loc="upper right", fontsize=6, framealpha=0.8)
 
-        add_prior_prism(ax, x_limits, y_limits, (z6_min, z6_max))
+        add_prior_prism(ax, x_limits, y_limits, (z_axis_min, z_axis_max))
         if observed_z is not None:
             ax.scatter(
                 observed_z[i],
                 observed_z[j],
-                observed_z[5],
+                observed_z[last_index],
                 marker="*",
                 c="#ff00cc",
                 edgecolors="black",
@@ -306,23 +313,23 @@ def plot_z6_triplets(
         y_values = z[:, j] if observed_z is None else np.append(z[:, j], observed_z[j])
         ax.set_xlim(min(float(x_values.min()), x_limits[0]), max(float(x_values.max()), x_limits[1]))
         ax.set_ylim(min(float(y_values.min()), y_limits[0]), max(float(y_values.max()), y_limits[1]))
-        ax.set_zlim(z6_min, z6_max)
+        ax.set_zlim(z_axis_min, z_axis_max)
         ax.set_xlabel(latent_label(i), labelpad=7)
         ax.set_ylabel(latent_label(j), labelpad=7)
-        ax.set_zlabel(latent_label(5), labelpad=7)
-        ax.set_title(rf"$(z_{i + 1}, z_{j + 1}, z_6)$", pad=4)
+        ax.set_zlabel(latent_label(last_index), labelpad=7)
+        ax.set_title(rf"$(z_{i + 1}, z_{j + 1}, z_{last_index + 1})$", pad=4)
         ax.view_init(elev=24, azim=-58)
         ax.tick_params(labelsize=7, pad=1)
 
     colorbar_axis = fig.add_subplot(grid[:, -1])
     colorbar = fig.colorbar(color_mappable, cax=colorbar_axis)
-    colorbar.set_label(r"$z_6$ (points inside shown priors)")
+    colorbar.set_label(rf"${last_label}$ (points inside shown priors)")
     fig.suptitle(title, fontsize=15)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_z6_triplets_interactive(
+def plot_last_latent_triplets_interactive(
     z: np.ndarray,
     parameters: np.ndarray,
     output_path: Path,
@@ -331,7 +338,7 @@ def plot_z6_triplets_interactive(
     observed_z: np.ndarray | None,
     title: str,
 ) -> None:
-    """Save rotatable Plotly versions of all ten z6 triplets."""
+    """Save rotatable Plotly versions of all z_last triplets."""
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -341,11 +348,13 @@ def plot_z6_triplets_interactive(
             "again or run `python -m pip install plotly`."
         ) from exc
 
-    triplets = list(combinations(range(5), 2))
+    last_index = z.shape[1] - 1
+    last_label = f"z{last_index + 1}"
+    triplets = list(combinations(range(last_index), 2))
     ncols = 3
     nrows = int(np.ceil(len(triplets) / ncols))
     subplot_titles = [
-        f"(z{i + 1}, z{j + 1}, z6)" for i, j in triplets
+        f"(z{i + 1}, z{j + 1}, {last_label})" for i, j in triplets
     ] + [""] * (nrows * ncols - len(triplets))
     figure = make_subplots(
         rows=nrows,
@@ -356,20 +365,25 @@ def plot_z6_triplets_interactive(
         vertical_spacing=0.055,
     )
 
-    z6_values = z[:, 5] if observed_z is None else np.append(z[:, 5], observed_z[5])
-    z6_min = float(z6_values.min())
-    z6_max = float(z6_values.max())
-    if z6_min == z6_max:
-        z6_min -= 0.5
-        z6_max += 0.5
-    hover_template = (
-        "z1=%{customdata[0]:.5g}<br>z2=%{customdata[1]:.5g}<br>"
-        "z3=%{customdata[2]:.5g}<br>z4=%{customdata[3]:.5g}<br>"
-        "z5=%{customdata[4]:.5g}<br>z6=%{customdata[5]:.5g}<br>"
-        "tau=%{customdata[6]:.5g}<br>T=%{customdata[7]:.5g}<br>"
-        "Nd=%{customdata[8]:.5g}<br>sigma=%{customdata[9]:.5g}<br>"
-        "Bmax=%{customdata[10]:.5g}<extra></extra>"
+    z_axis_values = (
+        z[:, last_index]
+        if observed_z is None
+        else np.append(z[:, last_index], observed_z[last_index])
     )
+    z_axis_min = float(z_axis_values.min())
+    z_axis_max = float(z_axis_values.max())
+    if z_axis_min == z_axis_max:
+        z_axis_min -= 0.5
+        z_axis_max += 0.5
+    latent_hover = "".join(
+        f"z{index + 1}=%{{customdata[{index}]:.5g}}<br>"
+        for index in range(z.shape[1])
+    )
+    parameter_hover = "".join(
+        f"{name}=%{{customdata[{z.shape[1] + index}]:.5g}}<br>"
+        for index, name in enumerate(PARAM_NAMES)
+    )
+    hover_template = latent_hover + parameter_hover + "<extra></extra>"
     custom_data = np.column_stack((z, parameters))
     outlier_legend_added = False
 
@@ -391,12 +405,12 @@ def plot_z6_triplets_interactive(
                 go.Scatter3d(
                     x=z[in_prior, i],
                     y=z[in_prior, j],
-                    z=z[in_prior, 5],
+                    z=z[in_prior, last_index],
                     mode="markers",
                     marker={
                         "size": 2.5,
                         "opacity": 0.32,
-                        "color": z[in_prior, 5],
+                        "color": z[in_prior, last_index],
                         "coloraxis": "coloraxis",
                     },
                     customdata=custom_data[in_prior],
@@ -411,7 +425,7 @@ def plot_z6_triplets_interactive(
                 go.Scatter3d(
                     x=z[~in_prior, i],
                     y=z[~in_prior, j],
-                    z=z[~in_prior, 5],
+                    z=z[~in_prior, last_index],
                     mode="markers",
                     marker={"size": 3.5, "opacity": 0.85, "color": "red"},
                     customdata=custom_data[~in_prior],
@@ -430,7 +444,7 @@ def plot_z6_triplets_interactive(
                 go.Scatter3d(
                     x=[observed_z[i]],
                     y=[observed_z[j]],
-                    z=[observed_z[5]],
+                    z=[observed_z[last_index]],
                     mode="markers",
                     marker={
                         "size": 9,
@@ -440,10 +454,9 @@ def plot_z6_triplets_interactive(
                     },
                     customdata=[observed_z],
                     hovertemplate=(
-                        "<b>obsSN</b><br>z1=%{customdata[0]:.5g}<br>"
-                        "z2=%{customdata[1]:.5g}<br>z3=%{customdata[2]:.5g}<br>"
-                        "z4=%{customdata[3]:.5g}<br>z5=%{customdata[4]:.5g}<br>"
-                        "z6=%{customdata[5]:.5g}<extra></extra>"
+                        "<b>obsSN</b><br>"
+                        + latent_hover
+                        + "<extra></extra>"
                     ),
                     name="obsSN",
                     legendgroup="obsSN",
@@ -467,7 +480,10 @@ def plot_z6_triplets_interactive(
                 "title": f"z{j + 1} ({PARAM_NAMES[j]})",
                 "range": [min(float(y_values.min()), y_lo), max(float(y_values.max()), y_hi)],
             },
-            zaxis={"title": "z6 (free)", "range": [z6_min, z6_max]},
+            zaxis={
+                "title": latent_label(last_index).replace("$", ""),
+                "range": [z_axis_min, z_axis_max],
+            },
             aspectmode="cube",
         )
 
@@ -478,9 +494,9 @@ def plot_z6_triplets_interactive(
         margin={"l": 20, "r": 120, "t": 90, "b": 20},
         coloraxis={
             "colorscale": "Viridis",
-            "cmin": z6_min,
-            "cmax": z6_max,
-            "colorbar": {"title": "z6", "len": 0.55},
+            "cmin": z_axis_min,
+            "cmax": z_axis_max,
+            "colorbar": {"title": last_label, "len": 0.55},
         },
     )
     figure.write_html(output_path, include_plotlyjs=True, full_html=True)
@@ -504,9 +520,10 @@ def main():
         )
 
     ndims_latent = int(hp["ndims_latent"])
-    if ndims_latent != 6:
+    if ndims_latent not in (5, 6):
         raise ValueError(
-            f"The z6-triplet plots require ndims_latent=6; this run has {ndims_latent}"
+            "The triplet plots require ndims_latent=5 or ndims_latent=6; "
+            f"this run has {ndims_latent}"
         )
 
     num_fft_components = int(hp["num_fft_components"])
@@ -607,8 +624,11 @@ def main():
         f"n{args.nsamples}_seed{args.seed}"
     )
     data_path = output_dir / f"{file_stem}.npz"
-    plot_path = output_dir / f"{file_stem}_z6_triplets.png"
-    interactive_path = output_dir / f"{file_stem}_z6_triplets_interactive.html"
+    last_latent_label = f"z{ndims_latent}"
+    plot_path = output_dir / f"{file_stem}_{last_latent_label}_triplets.png"
+    interactive_path = (
+        output_dir / f"{file_stem}_{last_latent_label}_triplets_interactive.html"
+    )
     saved_arrays = {
         "parameters": parameters,
         "latent": latent,
@@ -624,7 +644,7 @@ def main():
             observed_data_path=np.asarray(str(observed_data_path)),
         )
     np.savez_compressed(data_path, **saved_arrays)
-    plot_z6_triplets(
+    plot_last_latent_triplets(
         latent,
         plot_path,
         prior_limits=prior_limits,
@@ -636,7 +656,7 @@ def main():
         dpi=args.dpi,
     )
     if args.interactive:
-        plot_z6_triplets_interactive(
+        plot_last_latent_triplets_interactive(
             latent,
             parameters,
             interactive_path,
@@ -650,9 +670,9 @@ def main():
 
     print(f"[OK] Restored: {checkpoint_path}")
     print(f"[OK] Saved samples: {data_path}")
-    print(f"[OK] Saved z6 triplet plots: {plot_path}")
+    print(f"[OK] Saved {last_latent_label} triplet plots: {plot_path}")
     if args.interactive:
-        print(f"[OK] Saved interactive z6 triplets: {interactive_path}")
+        print(f"[OK] Saved interactive {last_latent_label} triplets: {interactive_path}")
 
 
 if __name__ == "__main__":
