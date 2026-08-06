@@ -261,12 +261,7 @@ class ExpSetup:
         self.ndims_latent = 6
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
-        self.representation_mode = "fourier_log_amplitude"
-        self.fourier_transform = "log1p_abs_rfft"
         self.num_fft_components = 100
-        self.noise_representation_mode = "time_resized"
-        self.encoder_architecture = "conv1d_16_16_pool_32_32_gap"
-        self.decoder_architecture = "noise_conditioned_cnn_32_32_16"
 
         # SDDE sim settings
         self.Twarmup = 200
