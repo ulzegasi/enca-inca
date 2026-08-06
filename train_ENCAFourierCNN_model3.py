@@ -457,9 +457,14 @@ def main():
     ##################################################################################################
     # Define optimizer
     # --- Custom LR schedule: linear warmup from ~0 to your initial LR, then exponential decay ---
-    # lr_schedule = src.utils_tf.LearningRateScheduleExponentialDecayWithLinearWarmup(steps_warmup=args.linear_warmup_steps, initial_learning_rate=1.e-3, decay_steps=int(6*1e3), decay_rate=0.92, staircase=True)
+    # lr_schedule = src.utils_tf.LearningRateScheduleExponentialDecayWithLinearWarmup(steps_warmup=args.linear_warmup_steps, initial_learning_rate=1.e-3, decay_steps=int(18e3), decay_rate=0.92, staircase=True)
     # --- Exponential decay with fixed initial LR ---
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1.e-3, decay_steps=int(6*1e3), decay_rate=0.92, staircase=True)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1.e-3,
+        decay_steps=int(18e3),
+        decay_rate=0.92,
+        staircase=True,
+    )
     # --- Optimizer ---
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     #, clipnorm=1e5, clipvalue=1.)
