@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=enca3z20b
+#SBATCH --job-name=mlp1z6
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca

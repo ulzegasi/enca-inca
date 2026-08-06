@@ -344,3 +344,5 @@ tags
 .renku.lock
 .renku/tmp
 .renku/cache
+
+sdde_MLPwithNoise_runs/

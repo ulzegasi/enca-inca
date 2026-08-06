@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=mlp3z8
+#SBATCH --job-name=mlp1z5
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -9,8 +9,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
-#SBATCH --time=4-00:00:00
-#SBATCH --partition=earth-4
+#SBATCH --time=3-00:00:00
+#SBATCH --partition=earth-5
 #SBATCH --no-requeue
 #SBATCH --constraint=rhel8
 #SBATCH --mail-type=fail,end
@@ -37,7 +37,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
-export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_z8_1
+export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_z5_1
 mkdir -p "$MLP_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=mlpnoise-z6
+#SBATCH --job-name=mlp2z6
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -31,7 +31,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_MLPwithNoise_runs
 
 # For a continuation, replace the date and keep the original run directory.
 RUNSTAMP=$(date +%Y%m%d)
-export MLP_NOISE_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLPwithNoise_runs/${RUNSTAMP}_mlpnoise_z6_1
+export MLP_NOISE_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLPwithNoise_runs/${RUNSTAMP}_mlp_z6_2
 mkdir -p "$MLP_NOISE_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3

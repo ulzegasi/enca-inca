@@ -340,7 +340,7 @@ class ExpSetup:
 
         # FNO architecture settings
         self.fno_width = 64
-        self.fno_modes = 32
+        self.fno_modes = 64
         self.fno_layers = 4
         self.use_time_coordinate = True
 
@@ -390,7 +390,7 @@ class ExpSetup:
 
         # Optimizer schedule (stored with the run hyperparameters).
         self.initial_learning_rate = 1.e-3
-        self.lr_decay_steps = int(12e3)
+        self.lr_decay_steps = int(18e3)  # Standard: int(12e3)
         self.lr_decay_rate = 0.92
         self.lr_staircase = True
         

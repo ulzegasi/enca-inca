@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=FNOz20m32v2
+#SBATCH --job-name=FNOz10m32v3
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
 #SBATCH --time=04-00:00:00
-#SBATCH --partition=earth-4
+#SBATCH --partition=earth-5
 #SBATCH --no-requeue
 #SBATCH --constraint=rhel8
 #SBATCH --mail-type=fail,end
@@ -37,7 +37,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260615.
 RUNSTAMP=$(date +%Y%m%d)
-export FNO_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs/${RUNSTAMP}_fno_z20_m32_2
+export FNO_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_FNO_runs/${RUNSTAMP}_fno_z10_m32_3
 mkdir -p "$FNO_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3

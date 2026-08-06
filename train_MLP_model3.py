@@ -222,7 +222,7 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("MLP_LOGDIR", default_logdir)
 
-        self.ndims_latent = 6
+        self.ndims_latent = 5
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
         self.representation_mode = "fourier_amplitude"
@@ -242,7 +242,7 @@ class ExpSetup:
         self.len_timeseries = int(round(ratio))  # equals Tobs if saveat=1.0
 
         self.batch_size = 300
-        self.max_training_steps = int(2e6) # int(3000) # int(3e6)
+        self.max_training_steps = int(1.2e6) # int(3000) # int(3e6)
         self.freq_log = 500
 
         # Loss setup
