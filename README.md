@@ -12,10 +12,11 @@ The repository contains the code needed to train the proposed models _explicit n
 - `train_ENCA_model1.py`, `train_INCA_model1.py`: original model 1 experiments
 - `train_ENCA_model2.py`, `train_INCA_model2.py`: original model 2 experiments
 - `train_ENCA_model3.py`: solar-dynamo / SDDE ENCA experiments using the Julia-backed simulator
+- `train_ENCAFourierCNN_model3.py`: Fourier-space SDDE ENCA with a noise-conditioned CNN decoder
 - `train_MLP_model3.py`: solar-dynamo / SDDE MLP experiments on Fourier-amplitude representations
 - `train_FNO_model3.py`: solar-dynamo / SDDE FNO experiments with configurable time- or Fourier-domain reconstruction loss
 
-Supporting code lives in `src/`. Local solar-dynamo training outputs are written to `sdde_ENCA_runs/` for ENCA and `sdde_MLP_runs/` for MLP.
+Supporting code lives in `src/`. Local solar-dynamo training outputs are written to `sdde_ENCA_runs/` for time-domain ENCA, `sdde_ENCAFourierCNN_runs/` for Fourier-CNN ENCA, and `sdde_MLP_runs/` for MLP.
 
 ## Demo   
 The repository can be set up on a clean environment by creating a conda environment:
@@ -70,6 +71,21 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 - default output directory: `sdde_ENCA_runs/`
 - logdir override: `ENCA_LOGDIR=/path/to/run`
 - cluster launchers: `runtraining_cpu.sh`, `runtraining_gpu.sh`
+
+### Fourier-CNN ENCA
+
+[train_ENCAFourierCNN_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCAFourierCNN_model3.py) is the TensorFlow/Keras counterpart of the Fourier ENCA used in `AdvancedTopicsInPhysicsOfData-Project`, adapted to the online SDDE workflow in this repository.
+
+- input representation: first 100 components of `log1p(abs(rFFT(x)))`, with shape `[batch, 100, 1]`
+- encoder: `Conv1D(16) -> Conv1D(16) -> MaxPool1D -> Conv1D(32) -> Conv1D(32) -> Conv1D(ndims_latent) -> GlobalAveragePooling1D`
+- decoder: project the latent vector to 100 positions, resize the simulator noise from 271 to 100 positions, concatenate both channels, then apply `Conv1D(32) -> Conv1D(32) -> Conv1D(16) -> Conv1D(1)`
+- default settings: `Tobs = 271`, `ndims_latent = 6`, batch size 300, and 1.2 million online-training steps
+- loss: balanced per-sample reconstruction MSE plus prior-width-normalized parameter regression MSE
+- default output directory: `sdde_ENCAFourierCNN_runs/`
+- logdir override: `ENCA_FOURIER_CNN_LOGDIR=/path/to/run`
+- GPU cluster launcher: `runtraining_gpu_encafouriercnn.sh`
+
+The reference PyTorch project standardizes its Fourier data using mean and standard deviation computed from a finite training set. This online variant does not use dataset-wide standardization; `log1p` compresses the spectral dynamic range and the balanced reconstruction loss normalizes each sample's error by its RMS spectral amplitude.
 
 ### MLP
 
