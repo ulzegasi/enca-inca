@@ -144,6 +144,10 @@ class Manage_Hyper_Parameters:
         """
         Compare current args (ExpSetup) against the saved hyper_parameters.json.
 
+        ``max_training_steps`` is an operational stopping target rather than a
+        model hyper-parameter.  It may therefore be increased when resuming a
+        completed run without invalidating the checkpoint configuration.
+
         - Treat list/tuple as equivalent (JSON turns tuples into lists).
         - Treat numpy scalars as Python scalars.
         - For floats, allow tiny numerical differences.
@@ -186,6 +190,17 @@ class Manage_Hyper_Parameters:
             if k.startswith("__"):
                 continue
             if k == "logdir":
+                continue
+
+            if k == "max_training_steps":
+                if hasattr(self.args, k):
+                    old_v = getattr(self.args, k)
+                    new_v = getattr(args, k)
+                    if not _equal(old_v, new_v):
+                        print(
+                            "INFO: continuing with updated absolute training-step target: "
+                            f"{old_v} -> {new_v}."
+                        )
                 continue
 
             if not hasattr(self.args, k):
@@ -282,7 +297,10 @@ class ExpSetup:
             )
 
         self.batch_size = 300
-        self.max_training_steps = int(1.2e6)
+        # Absolute optimizer-step target. Increasing this value and restoring
+        # the original run directory continues training from its latest
+        # checkpoint; it does not restart the step count.
+        self.max_training_steps = int(1.6e6)
         self.freq_log = 500
 
         # Loss setup

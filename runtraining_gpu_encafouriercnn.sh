@@ -1,16 +1,16 @@
 #!/bin/bash
 #
-#SBATCH --job-name=encafcnn3z6
+#SBATCH --job-name=encafcnn_z6
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
 #
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
 #SBATCH --time=4-00:00:00
-#SBATCH --partition=earth-4
+#SBATCH --partition=earth-5
 #SBATCH --no-requeue
 #SBATCH --constraint=rhel8
 #SBATCH --mail-type=fail,end
@@ -34,11 +34,19 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs
 
-# For the first launch, keep the automatic date stamp.
-# For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
-RUNSTAMP=$(date +%Y%m%d)
-export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_z6_3
+# Continue the existing 2026-08-07 run. The trainer restores the latest
+# checkpoint in this directory and advances its absolute target to 1.6M steps.
+# RUNSTAMP=$(date +%Y%m%d)  # Fresh run
+RUNSTAMP=20260807
+export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_z6
 mkdir -p "$ENCA_FOURIER_CNN_LOGDIR"
+
+# This launcher is intentionally a continuation job. Refuse to start a new
+# model silently if the run directory or checkpoint prefix is mistyped.
+if ! compgen -G "$ENCA_FOURIER_CNN_LOGDIR/model_ckpt-*.index" > /dev/null; then
+    echo "ERROR: no model_ckpt-*.index found in $ENCA_FOURIER_CNN_LOGDIR" >&2
+    exit 1
+fi
 
 export TF_CPP_MIN_LOG_LEVEL=3
 export TF_ENABLE_ONEDNN_OPTS=0
