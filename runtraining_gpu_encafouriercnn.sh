@@ -34,19 +34,10 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs
 
-# Continue the existing 2026-08-07 run. The trainer restores the latest
-# checkpoint in this directory and advances its absolute target to 1.6M steps.
 # RUNSTAMP=$(date +%Y%m%d)  # Fresh run
-RUNSTAMP=20260807
+RUNSTAMP=20260807           # Continuation
 export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_z6
 mkdir -p "$ENCA_FOURIER_CNN_LOGDIR"
-
-# This launcher is intentionally a continuation job. Refuse to start a new
-# model silently if the run directory or checkpoint prefix is mistyped.
-if ! compgen -G "$ENCA_FOURIER_CNN_LOGDIR/model_ckpt-*.index" > /dev/null; then
-    echo "ERROR: no model_ckpt-*.index found in $ENCA_FOURIER_CNN_LOGDIR" >&2
-    exit 1
-fi
 
 export TF_CPP_MIN_LOG_LEVEL=3
 export TF_ENABLE_ONEDNN_OPTS=0
