@@ -31,6 +31,7 @@ import datetime
 import numpy as np
 import sys
 import json
+import argparse
 import logging
 import time
 
@@ -54,10 +55,30 @@ import src.generators
 import src.utils_tf
 
 ##################################################################################################
-def timeseries_to_fourier_log_amplitude(x, num_fft_components):
-    """Map [batch, time, 1] signals to log1p rFFT magnitudes [batch, n_fft, 1]."""
+VALID_WINDOWS = ("", "Hann")
+
+
+def validate_window(window):
+    if window not in VALID_WINDOWS:
+        raise ValueError(
+            f"Unknown window {window!r}. Expected an empty string (no window) or 'Hann'."
+        )
+    return window
+
+
+def timeseries_to_fourier_log_amplitude(x, num_fft_components, window=""):
+    """Map [batch, time, 1] signals to log1p rFFT magnitudes [batch, n_fft, 1].
+
+    An empty ``window`` preserves the original ENCA Fourier-CNN transform.
+    ``window='Hann'`` applies a symmetric Hann window before the rFFT.
+    """
+    validate_window(window)
     x = tf.convert_to_tensor(x, dtype=tf.float32)
     x_1d = tf.squeeze(x, axis=-1)
+    if window == "Hann":
+        n_time = tf.shape(x_1d)[1]
+        hann = tf.signal.hann_window(n_time, periodic=False, dtype=x_1d.dtype)
+        x_1d = x_1d * hann[tf.newaxis, :]
     spectrum = tf.signal.rfft(x_1d)
     amplitudes = tf.abs(spectrum)[:, :num_fft_components]
     return tf.expand_dims(tf.math.log1p(amplitudes), axis=-1)
@@ -189,6 +210,22 @@ class Manage_Hyper_Parameters:
                 continue
 
             if not hasattr(self.args, k):
+                # Fourier-CNN runs created before the window option used no
+                # window. Do not allow such a checkpoint to resume with Hann
+                # preprocessing merely because its JSON lacks the new key.
+                if k == "window":
+                    old_v = ""
+                    new_v = getattr(args, k)
+                    if not _equal(old_v, new_v):
+                        mismatches.append((k, old_v, new_v))
+                    else:
+                        print(
+                            'WARNING: key "window" was missing in the saved '
+                            'hyper-parameter configuration; treating it as the '
+                            'legacy empty value and renewing the file.'
+                        )
+                        save_args = True
+                    continue
                 print(f'WARNING: key "{k}" was missing in the saved hyper-parameter configuration; will renew file.')
                 save_args = True
                 continue
@@ -199,9 +236,6 @@ class Manage_Hyper_Parameters:
             if not _equal(old_v, new_v):
                 mismatches.append((k, old_v, new_v))
 
-        if save_args:
-            self.save_parameters(args)
-
         if mismatches:
             # Print all mismatches, then stop.
             for k, old_v, new_v in mismatches:
@@ -210,6 +244,9 @@ class Manage_Hyper_Parameters:
                 f"Hyper-parameter mismatch detected ({len(mismatches)} keys). "
                 "Either restore the old settings or start a new logdir."
             )
+
+        if save_args:
+            self.save_parameters(args)
 
         return None
     def save_parameters(self, args):
@@ -248,7 +285,7 @@ class Manage_Hyper_Parameters:
 
 ##################################################################################################
 class ExpSetup:
-    def __init__(self):
+    def __init__(self, window=""):
         tag = "fourier_cnn"
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_logdir = os.path.join(
@@ -262,6 +299,7 @@ class ExpSetup:
         self.num_noise_channels = 1
         self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
         self.num_fft_components = 100
+        self.window = validate_window(window)
 
         # SDDE sim settings
         self.Twarmup = 200
@@ -305,9 +343,22 @@ class ExpSetup:
         self.Bmax_lims = (1.0, 15.0)
 
 ##################################################################################################
+def parse_command_line_args():
+    parser = argparse.ArgumentParser(description="Train the ENCA Fourier-CNN model.")
+    parser.add_argument(
+        "--window",
+        default="",
+        choices=VALID_WINDOWS,
+        help="FFT window: pass an empty string for the legacy transform or 'Hann'.",
+    )
+    return parser.parse_args()
+
+
+##################################################################################################
 def main():
 
-    args = ExpSetup()
+    cli_args = parse_command_line_args()
+    args = ExpSetup(window=cli_args.window)
 
     if not os.path.isdir(args.logdir):
         os.makedirs(args.logdir)
@@ -353,7 +404,9 @@ def main():
         x_raw = tf.convert_to_tensor(x_np)
         params = tf.convert_to_tensor(p_np)
         noise = tf.convert_to_tensor(n_np)
-        x = timeseries_to_fourier_log_amplitude(x_raw, args.num_fft_components)
+        x = timeseries_to_fourier_log_amplitude(
+            x_raw, args.num_fft_components, window=args.window
+        )
         return x, params, noise
 
     ##################################################################################################
@@ -589,6 +642,7 @@ def main():
     print("x stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+    print(f"FFT window: {args.window or 'none (legacy)'}")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
     # --- warm up tf.function tracing/compilation ---
@@ -786,6 +840,15 @@ class Sampler:
             self.args.logdir = kwargs.get('logdir')
         if not os.path.isdir(self.args.logdir):
             raise AssertionError('logdir %s from ExpSetup is not found. Quitting.' % self.args.logdir)
+        # The command-line option is relevant only while training. When a
+        # checkpoint is loaded, its saved preprocessing setting is authoritative.
+        hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
+        if hp_manager.args is None:
+            raise AssertionError(
+                'Hyper-parameter configuration file %s is not found. Quitting.'
+                % hp_manager.param_config_fn
+            )
+        self.args.window = validate_window(getattr(hp_manager.args, 'window', ''))
         self.check_hyper_params()
         self.prng = kwargs.get('prng', np.random.RandomState(1999))
         self.model_obj = None
@@ -809,7 +872,9 @@ class Sampler:
         for i in range(num_samples):
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32)
-            x_i = timeseries_to_fourier_log_amplitude(x_i, self.args.num_fft_components)
+            x_i = timeseries_to_fourier_log_amplitude(
+                x_i, self.args.num_fft_components, window=self.args.window
+            )
             noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
             o_latent = self.model_obj.encoder(x_i, training=False).numpy()
             summary_space[i,...] = o_latent
@@ -821,7 +886,9 @@ class Sampler:
 
     def encode(self, samples):
         '''Encode raw samples shaped [num_samples, len_timeseries, 1].'''
-        samples_fourier = timeseries_to_fourier_log_amplitude(samples, self.args.num_fft_components)
+        samples_fourier = timeseries_to_fourier_log_amplitude(
+            samples, self.args.num_fft_components, window=self.args.window
+        )
         o_latent = self.model_obj.encoder(samples_fourier)
         return o_latent
 
@@ -837,7 +904,9 @@ class Sampler:
         for i in range(num_samples):
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32)
-            x_i = timeseries_to_fourier_log_amplitude(x_i, self.args.num_fft_components)
+            x_i = timeseries_to_fourier_log_amplitude(
+                x_i, self.args.num_fft_components, window=self.args.window
+            )
             noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
             z_latent = self.model_obj.encoder(x_i, training=False)
             o_reconst = self.model_obj.decoder((z_latent, noise_i), training=False).numpy()

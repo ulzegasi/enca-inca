@@ -39,6 +39,9 @@ RUNSTAMP=20260807           # Continuation
 export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_z6
 mkdir -p "$ENCA_FOURIER_CNN_LOGDIR"
 
+# Use an empty string for the original transform or "Hann" for Hann windowing.
+WINDOW=""
+
 export TF_CPP_MIN_LOG_LEVEL=3
 export TF_ENABLE_ONEDNN_OPTS=0
 
@@ -58,9 +61,11 @@ echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "ENCA_FOURIER_CNN_LOGDIR=$ENCA_FOURIER_CNN_LOGDIR"
+echo "WINDOW=${WINDOW:-none (legacy)}"
 nvidia-smi || true
 
 # ==============================
 # Run
 # ==============================
-srun --export=ALL,ENCA_FOURIER_CNN_LOGDIR="$ENCA_FOURIER_CNN_LOGDIR" --cpu-bind=cores python train_ENCAFourierCNN_model3.py
+srun --export=ALL,ENCA_FOURIER_CNN_LOGDIR="$ENCA_FOURIER_CNN_LOGDIR" --cpu-bind=cores \
+    python train_ENCAFourierCNN_model3.py --window "$WINDOW"
