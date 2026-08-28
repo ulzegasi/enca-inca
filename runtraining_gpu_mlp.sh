@@ -28,8 +28,8 @@
 module load cuda/11.6.2
 
 # SDDE variant used by DataGenerator_SolarDynamo_SDDE_ENCA.
-# May be overridden at submission time; valid values are "original" and "jupiter".
-export MODEL="${MODEL:-jupiter}"
+# Valid values are "original" and "jupiter".
+export MODEL="jupiter"
 
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
 mkdir -p "$JULIA_DEPOT_PATH"
