@@ -22,6 +22,14 @@ import numpy as np
 
 jl = None
 _INITIALIZED = False
+JUPITER_PERIOD = 11.86
+
+
+def _normalize_model(model: str) -> str:
+    model = str(model).strip().lower()
+    if model not in {"original", "jupiter"}:
+        raise ValueError(f"Unknown SDDE model {model!r}; expected 'original' or 'jupiter'.")
+    return model
 
 def _init_julia():
     """
@@ -67,6 +75,26 @@ def _init_julia():
             SA[du1, du2]
         end
 
+        # Jupiter modulation:
+        # Nd(t) = Nd * (1 + Aj*cos(2*pi*t/Pjupiter + phase)).
+        # phase is a realization-specific nuisance variable, not an inferred
+        # component of theta.
+        function f_jupiter(u,h,p,t)
+            τ, T, Nd, sigma, Bmax, Aj, phase, Pjupiter = p
+            hist = h(p, t - T, idxs = 1)
+            Nd_t = Nd * (1 + Aj*cos(2*π*t/Pjupiter + phase))
+            du1 = u[2]
+            du2 = -u[1]/τ^2 - 2*u[2]/τ - Nd_t/τ^2*ftilde(hist, 1, Bmax)
+            SA[du1, du2]
+        end
+
+        function g_jupiter(u,h,p,t)
+            τ, T, Nd, sigma, Bmax, Aj, phase, Pjupiter = p
+            du1 = 0.0
+            du2 = Bmax*sigma / (τ^(3/2))
+            SA[du1, du2]
+        end
+
         function bfield(θ, Tsim; dt=0.1, saveat=1.0, seed=nothing)
             τ, T, Nd, sigma, Bmax = θ
             u0 = SA[Bmax, 0.0]
@@ -83,10 +111,43 @@ def _init_julia():
             solve(prob, EM(); dt=dt, saveat=saveat)
         end
 
+        function bfield_jupiter(θ, Tsim; phase, Pjupiter=11.86, dt=0.1, saveat=1.0, seed=nothing)
+            τ, T, Nd, sigma, Bmax, Aj = θ
+            u0 = SA[Bmax, 0.0]
+            p = (τ, T, Nd, sigma, Bmax, Aj, phase, Pjupiter)
+            h(p, t; idxs = nothing) = idxs == 1 ? Bmax : (Bmax, 0.0)
+            lags = (T,)
+            tspan = (0.0, Tsim)
+
+            prob = SDDEProblem(f_jupiter, g_jupiter, u0, h, tspan, p; constant_lags = lags)
+
+            if seed !== nothing
+                Random.seed!(seed)
+            end
+
+            solve(prob, EM(); dt=dt, saveat=saveat)
+        end
+
         function sn(θ; Twarmup=200, Tobs=929, dt=0.1, saveat=1.0, seed=nothing)
             @assert abs(saveat - 1.0) < 1e-12 "This implementation assumes saveat == 1.0"
             Tsim = Twarmup + Tobs
             sol = bfield(θ, Tsim; dt=dt, saveat=saveat, seed=seed)
+            y = map(abs2, sol[1, (Twarmup + 2):end])
+            return y
+        end
+
+        function sn_jupiter(θ; phase, Pjupiter=11.86, Twarmup=200, Tobs=929, dt=0.1, saveat=1.0, seed=nothing)
+            @assert abs(saveat - 1.0) < 1e-12 "This implementation assumes saveat == 1.0"
+            Tsim = Twarmup + Tobs
+            sol = bfield_jupiter(
+                θ,
+                Tsim;
+                phase=phase,
+                Pjupiter=Pjupiter,
+                dt=dt,
+                saveat=saveat,
+                seed=seed,
+            )
             y = map(abs2, sol[1, (Twarmup + 2):end])
             return y
         end
@@ -183,6 +244,82 @@ def _init_julia():
             return y_save[start:stop]
         end
 
+        function sn_from_noise_jupiter(
+            theta,
+            eps_dt;
+            phase,
+            Pjupiter=11.86,
+            Twarmup=200,
+            Tobs=929,
+            dt=0.1,
+            saveat=1.0,
+        )
+            @assert abs(saveat - 1.0) < 1e-12 "This implementation assumes saveat == 1.0"
+            @assert dt > 0
+            @assert Pjupiter > 0
+
+            τ, T, Nd, sigma, Bmax, Aj = theta
+            Tsim = Twarmup + Tobs
+
+            Ndt = Int(round(Tsim / dt))
+            @assert abs(Ndt*dt - Tsim) < 1e-9 "Tsim must be multiple of dt"
+            @assert length(eps_dt) >= Ndt "eps_dt too short: need Ndt = Tsim/dt"
+
+            lag_steps = Int(round(T / dt))
+            @assert lag_steps >= 1 "T/dt too small or dt too large"
+            @assert abs(lag_steps*dt - T) < 1e-6 "T must be (approximately) a multiple of dt for this discretization"
+
+            coeff = Bmax * sigma / (τ^(3/2))
+            sdt = sqrt(dt)
+
+            k = Int(round(1.0 / dt))
+            @assert abs(k*dt - 1.0) < 1e-12 "dt must divide 1.0 when saveat==1.0"
+
+            Nsave = Int(round(Tsim)) + 1
+            @assert abs(Tsim - (Nsave - 1)) < 1e-9 "Tsim must be integer when saveat==1.0"
+
+            B = Bmax
+            dB = 0.0
+            Bhist = fill(Bmax, lag_steps)
+            hidx = 1
+
+            y_save = Vector{Float64}(undef, Nsave)
+            y_save[1] = B^2
+
+            i = 0
+            @inbounds for j in 1:(Nsave-1)
+                for _sub in 1:k
+                    i += 1
+
+                    B_delay = Bhist[hidx]
+                    t = (i - 1) * dt
+                    Nd_t = Nd * (1 + Aj*cos(2*π*t/Pjupiter + phase))
+
+                    du1 = dB
+                    du2 = -B/τ^2 - 2*dB/τ - (Nd_t/τ^2) * ftilde(B_delay, 1, Bmax)
+
+                    dB_new = dB + du2*dt + coeff*sdt*eps_dt[i]
+                    B_new = B + du1*dt
+
+                    Bhist[hidx] = B_new
+                    hidx += 1
+                    if hidx > lag_steps
+                        hidx = 1
+                    end
+
+                    B, dB = B_new, dB_new
+                end
+
+                y_save[j+1] = B^2
+            end
+
+            start = Twarmup + 2
+            stop = start + Tobs - 1
+            @assert stop <= length(y_save)
+
+            return y_save[start:stop]
+        end
+
         function sn_for_enca(theta; Twarmup=200, Tobs=929, dt=0.1, saveat=1.0, seed=nothing)
             @assert abs(saveat - 1.0) < 1e-12 "This implementation assumes saveat == 1.0"
             Tsim = Twarmup + Tobs
@@ -266,10 +403,27 @@ def sn(
     dt: float = 0.1,
     saveat: float = 1.0,
     seed: Optional[int] = None,
+    model: str = "original",
+    phase: Optional[float] = None,
+    jupiter_period: float = JUPITER_PERIOD,
 ):
+    model = _normalize_model(model)
     _init_julia()
     # juliacall likes tuples for small fixed-size vectors
-    return jl.sn(tuple(theta), Twarmup=Twarmup, Tobs=Tobs, dt=dt, saveat=saveat, seed=seed)
+    if model == "original":
+        return jl.sn(tuple(theta), Twarmup=Twarmup, Tobs=Tobs, dt=dt, saveat=saveat, seed=seed)
+    if phase is None:
+        raise ValueError("phase is required for model='jupiter'.")
+    return jl.sn_jupiter(
+        tuple(theta),
+        phase=float(phase),
+        Pjupiter=float(jupiter_period),
+        Twarmup=Twarmup,
+        Tobs=Tobs,
+        dt=dt,
+        saveat=saveat,
+        seed=seed,
+    )
 
 
 def hann_window(Tmax: int):
@@ -306,9 +460,35 @@ def sn_for_enca(theta, Twarmup=200, Tobs=929, dt=0.1, saveat=1.0, seed=None):
     _init_julia()
     return jl.sn_for_enca(tuple(theta), Twarmup=Twarmup, Tobs=Tobs, dt=dt, saveat=saveat, seed=seed)
 
-def sn_from_noise(theta, eps, Twarmup=200, Tobs=929, dt=0.1, saveat=1.0):
+def sn_from_noise(
+    theta,
+    eps,
+    Twarmup=200,
+    Tobs=929,
+    dt=0.1,
+    saveat=1.0,
+    model="original",
+    phase=None,
+    jupiter_period=JUPITER_PERIOD,
+):
+    model = _normalize_model(model)
     _init_julia()
-    return jl.sn_from_noise(tuple(theta), eps, Twarmup=Twarmup, Tobs=Tobs, dt=dt, saveat=saveat)
+    if model == "original":
+        return jl.sn_from_noise(
+            tuple(theta), eps, Twarmup=Twarmup, Tobs=Tobs, dt=dt, saveat=saveat
+        )
+    if phase is None:
+        raise ValueError("phase is required for model='jupiter'.")
+    return jl.sn_from_noise_jupiter(
+        tuple(theta),
+        eps,
+        phase=float(phase),
+        Pjupiter=float(jupiter_period),
+        Twarmup=Twarmup,
+        Tobs=Tobs,
+        dt=dt,
+        saveat=saveat,
+    )
 
 def sn_nrep(theta, seeds, Twarmup=200, Tobs=929, dt=0.1, saveat=1.0):
     _init_julia()

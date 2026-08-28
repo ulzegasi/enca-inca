@@ -1,6 +1,8 @@
 # Author: Firat Ozdemir, October 2019, firat.ozdemir@datascience.ch
 # Updated by: Simone Ulzega, March 2026, simone.ulzega@zhaw.ch
 
+import os
+
 import numpy as np
 import src.utils as utils
 
@@ -180,12 +182,17 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
     """
     Yields tuples (x, params, noise) for ENCA training.
 
-    Deterministic map:
-        x = M(theta, eps)
-    with eps ~ N(0,1) independent of theta.
+    Deterministic maps conditional on the sampled nuisance variables:
+        original: x = M(theta, eps)
+        jupiter:  x = M(theta, eps, phi)
+    with eps ~ N(0,1) independent of theta.  For ``model="jupiter"``, phase
+    phi ~ Uniform(0, 2*pi) is also drawn independently for every realization.
+    The phase affects x but is deliberately not returned as an inferred
+    parameter.
 
     - x:     [L, 1] float32
-    - params:[5]    float32  (tau, T, Nd, sigma, Bmax)
+    - params:[5]    float32  (tau, T, Nd, sigma, Bmax), original model
+             [6]    float32  (tau, T, Nd, sigma, Bmax, Aj), Jupiter model
     - noise: [L, C] float32  (downsampled post-warmup view of the same bare
                               noise realization used to generate x)
 
@@ -206,8 +213,19 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
         Nd_lims=(1.0, 15.0),
         sigma_lims=(0.01, 0.3),
         Bmax_lims=(1.0, 15.0),
+        Aj_lims=(0.0, 0.1),
+        model=None,
+        jupiter_period: float = 11.86,
     ):
         self.prng = prng if prng is not None else np.random.RandomState(seed=1822)
+
+        # An explicit argument wins; otherwise use the launcher setting.  Keeping
+        # "original" as the fallback preserves existing scripts and checkpoints.
+        self.model = (model if model is not None else os.environ.get("MODEL", "original")).strip().lower()
+        if self.model not in {"original", "jupiter"}:
+            raise ValueError(
+                f"Unknown SDDE model {self.model!r}; expected 'original' or 'jupiter'."
+            )
 
         self.Tobs = int(Tobs)
         self.saveat = float(saveat)
@@ -221,6 +239,12 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
         self.Nd_lims = tuple(Nd_lims)
         self.sigma_lims = tuple(sigma_lims)
         self.Bmax_lims = tuple(Bmax_lims)
+        self.Aj_lims = tuple(Aj_lims)
+        self.jupiter_period = float(jupiter_period)
+        if len(self.Aj_lims) != 2 or self.Aj_lims[0] > self.Aj_lims[1]:
+            raise ValueError(f"Aj_lims must be an ordered pair, got {self.Aj_lims!r}.")
+        if self.jupiter_period <= 0.0:
+            raise ValueError(f"jupiter_period must be positive, got {self.jupiter_period}.")
 
         # enforce clean lengths (avoid silent off-by-one headaches)
         ratio = self.Tobs / self.saveat
@@ -258,7 +282,11 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
         Nd = float(self.prng.uniform(*self.Nd_lims))
         sigma = float(self.prng.uniform(*self.sigma_lims))
         Bmax = float(self.prng.uniform(*self.Bmax_lims))
-        return (tau, T, Nd, sigma, Bmax)
+        theta = (tau, T, Nd, sigma, Bmax)
+        if self.model == "jupiter":
+            Aj = float(self.prng.uniform(*self.Aj_lims))
+            theta += (Aj,)
+        return theta
 
     def __iter__(self):
         # lazy import (safe wrt Julia/TF init ordering)
@@ -276,6 +304,14 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
         while True:
             theta = self._sample_theta()
 
+            # phi is a nuisance variable: sample it independently for each
+            # realization, use it in the simulator, and do not append it to theta.
+            phase = (
+                float(self.prng.uniform(0.0, 2.0 * np.pi))
+                if self.model == "jupiter"
+                else None
+            )
+
             # bare noise for the Wiener increments (theta-independent)
             eps_dt = self.prng.normal(0.0, 1.0, size=(N_increments,)).astype(np.float32)
 
@@ -287,11 +323,14 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
                 Tobs=self.Tobs,
                 dt=self.dt,
                 saveat=self.saveat,
+                model=self.model,
+                phase=phase,
+                jupiter_period=self.jupiter_period,
             )
             y = np.asarray(y, dtype=np.float32)          # [L]
             x = y.reshape(-1, 1)                         # [L, 1]
 
-            params = np.asarray(theta, dtype=np.float32) # [5]
+            params = np.asarray(theta, dtype=np.float32) # [5] original, [6] Jupiter
 
             # Decoder conditioning uses the same bare-noise realization that generated x.
             # We keep the post-warmup window and downsample it to match x's [L, C] shape.

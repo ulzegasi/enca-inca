@@ -213,18 +213,24 @@ class Manage_Hyper_Parameters:
 ##################################################################################################
 class ExpSetup:
     def __init__(self):
+        self.model = os.environ.get("MODEL", "original").strip().lower()
+        if self.model not in {"original", "jupiter"}:
+            raise ValueError(
+                f"Unknown SDDE model {self.model!r}; expected 'original' or 'jupiter'."
+            )
+
         tag = "smoke"   # change this when you test something new
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_logdir = os.path.join(
             os.getcwd(),
             "sdde_MLP_runs",
-            f"{run_id}_{tag}"
+            f"{run_id}_{self.model}_{tag}"
         )
         self.logdir = os.environ.get("MLP_LOGDIR", default_logdir)
 
-        self.ndims_latent = 5
+        self.num_model_parameters = 6 if self.model == "jupiter" else 5
+        self.ndims_latent = self.num_model_parameters
         self.num_noise_channels = 1
-        self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
         self.representation_mode = "fourier_amplitude"
         self.num_fft_components = 100
         self.fft_log_eps = 1e-8
@@ -234,6 +240,7 @@ class ExpSetup:
         self.Tobs = 271 # C14 dataset: 929, obsSN dataset: 271
         self.dt = 0.1
         self.saveat = 1.0
+        self.jupiter_period = 11.86
 
         # derived length used by NN + dataset shapes
         ratio = self.Tobs / self.saveat
@@ -263,6 +270,7 @@ class ExpSetup:
         self.sigma_lims = (0.005, 0.05)
         # --------------------------------------------------------
         self.Bmax_lims = (1.0, 15.0)
+        self.Aj_lims = (0.0, 0.1)
         
         """
         # parameter priors for "easy training"
@@ -301,6 +309,9 @@ def main():
         Nd_lims=args.Nd_lims,
         sigma_lims=args.sigma_lims,
         Bmax_lims=args.Bmax_lims,
+        Aj_lims=args.Aj_lims,
+        model=args.model,
+        jupiter_period=args.jupiter_period,
     )
     
     @tf.function
@@ -328,8 +339,13 @@ def main():
 
         # Stack into numpy batches
         x_np = np.stack(xs, axis=0).astype(np.float32)      # (B, len, 1)
-        p_np = np.stack(ps, axis=0).astype(np.float32)      # (B, 5)
+        p_np = np.stack(ps, axis=0).astype(np.float32)      # (B, num_model_parameters)
         n_np = np.stack(ns, axis=0).astype(np.float32)      # (B, len, nc)
+        if p_np.shape[1] != args.num_model_parameters:
+            raise ValueError(
+                f"Generator returned {p_np.shape[1]} parameters for model={args.model!r}; "
+                f"expected {args.num_model_parameters}."
+            )
 
         # Convert to TF tensors
         x_raw = tf.convert_to_tensor(x_np)
@@ -358,13 +374,24 @@ def main():
             sd = tf.math.squared_difference(y_true, y_pred)
             return tf.math.reduce_sum(sd / tf.math.maximum(tf.math.pow(y_true, 2), 1e-6), axis= -1)
 
-    param_widths = tf.constant([
+    param_width_values = [
         args.tau_lims[1] - args.tau_lims[0],
         args.T_lims[1] - args.T_lims[0],
         args.Nd_lims[1] - args.Nd_lims[0],
         args.sigma_lims[1] - args.sigma_lims[0],
         args.Bmax_lims[1] - args.Bmax_lims[0],
-    ], dtype=tf.float32)
+    ]
+    if args.model == "jupiter":
+        param_width_values.append(args.Aj_lims[1] - args.Aj_lims[0])
+    if len(param_width_values) != args.num_model_parameters:
+        raise ValueError(
+            f"Configured {len(param_width_values)} parameter widths, expected "
+            f"{args.num_model_parameters} for model={args.model!r}."
+        )
+    param_widths = tf.constant(param_width_values, dtype=tf.float32)
+    parameter_names = ["tau", "T", "Nd", "sigma", "Bmax"]
+    if args.model == "jupiter":
+        parameter_names.append("Aj")
 
     @tf.function
     def loss_reconstruction_fn_legacy(x, x_pred, return_each_dim=False):
@@ -578,6 +605,7 @@ def main():
     print("x stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+    print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
     # --- warm up tf.function tracing/compilation ---
@@ -666,31 +694,24 @@ def main():
 
             # --- Parameter ranges in current batch ---
             # (safe even with batch_size=1; then min==max)
-            p = params.numpy()   # shape (B, 5)
-
-            tau_min, tau_max     = float(p[:,0].min()), float(p[:,0].max())
-            T_min, T_max         = float(p[:,1].min()), float(p[:,1].max())
-            Nd_min, Nd_max       = float(p[:,2].min()), float(p[:,2].max())
-            sigma_min, sigma_max = float(p[:,3].min()), float(p[:,3].max())
-            Bmax_min, Bmax_max   = float(p[:,4].min()), float(p[:,4].max())
+            p = params.numpy()   # shape (B, num_model_parameters)
+            parameter_ranges = {
+                name: (float(p[:, i].min()), float(p[:, i].max()))
+                for i, name in enumerate(parameter_names)
+            }
 
             logging.info(
                 "params ranges: "
-                f"tau[{tau_min:.3f},{tau_max:.3f}] "
-                f"T[{T_min:.3f},{T_max:.3f}] "
-                f"Nd[{Nd_min:.3f},{Nd_max:.3f}] "
-                f"sigma[{sigma_min:.3f},{sigma_max:.3f}] "
-                f"Bmax[{Bmax_min:.3f},{Bmax_max:.3f}]"
+                + " ".join(
+                    f"{name}[{bounds[0]:.3f},{bounds[1]:.3f}]"
+                    for name, bounds in parameter_ranges.items()
+                )
             )
 
             # Optional: also push ranges to TensorBoard
-            d_scalars.update({
-                "theta/tau_min": tau_min, "theta/tau_max": tau_max,
-                "theta/T_min": T_min, "theta/T_max": T_max,
-                "theta/Nd_min": Nd_min, "theta/Nd_max": Nd_max,
-                "theta/sigma_min": sigma_min, "theta/sigma_max": sigma_max,
-                "theta/Bmax_min": Bmax_min, "theta/Bmax_max": Bmax_max,
-            })
+            for name, (lower, upper) in parameter_ranges.items():
+                d_scalars[f"theta/{name}_min"] = lower
+                d_scalars[f"theta/{name}_max"] = upper
 
             for k in dict_avg_loss_recon_items:
                 d_scalars[k] = dict_avg_loss_recon_items[k].result()
@@ -897,6 +918,9 @@ class Sampler:
             Nd_lims=self.args.Nd_lims,
             sigma_lims=self.args.sigma_lims,
             Bmax_lims=self.args.Bmax_lims,
+            Aj_lims=self.args.Aj_lims,
+            model=self.args.model,
+            jupiter_period=self.args.jupiter_period,
         )
 
         iterator = generator.__iter__()
