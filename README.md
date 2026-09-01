@@ -80,7 +80,9 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 
 [train_ENCAFourierCNN_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_ENCAFourierCNN_model3.py) is the TensorFlow/Keras counterpart of the Fourier ENCA used in `AdvancedTopicsInPhysicsOfData-Project`, adapted to the online SDDE workflow in this repository.
 
-- input representation: first 100 components of `log1p(abs(rFFT(x)))`, with shape `[batch, 100, 1]`; pass `--window Hann` to apply a symmetric Hann window to `x` before the rFFT (the default empty value preserves the legacy unwindowed transform)
+- input representation: first 100 components of
+  `log1p(abs(rFFT(Hann(x))))`, with shape `[batch, 100, 1]`; the symmetric Hann
+  window is mandatory and saved as `window="Hann"` in checkpoint metadata
 - encoder: `Conv1D(16) -> Conv1D(16) -> MaxPool1D -> Conv1D(32) -> Conv1D(32) -> Conv1D(ndims_latent) -> GlobalAveragePooling1D`
 - decoder: project the latent vector to 100 positions, resize the simulator noise from 271 to 100 positions, concatenate both channels, then apply `Conv1D(32) -> Conv1D(32) -> Conv1D(16) -> Conv1D(1)`
 - default settings: `Tobs = 271`, `ndims_latent = 6`, batch size 300, and 1.2 million online-training steps
@@ -100,11 +102,9 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 - logdir override: `ENCA_FOURIER_CNN_LOGDIR=/path/to/run`
 - GPU cluster launcher: `runtraining_gpu_encafouriercnn.sh`
 
-The launcher defines `WINDOW=""`. Set it to `WINDOW="Hann"` for a fresh
-Hann-windowed run; it passes the selection to the training script as
-`--window "$WINDOW"`. The choice is stored as `window` in
-`hyper_parameters.json`, and a checkpoint cannot be resumed with a different
-choice. Runs created before this option existed are interpreted as `window=""`.
+The training script and cluster launcher expose no unwindowed option. SDDEpy
+reads the saved preprocessing metadata automatically; its internal legacy
+reader remains available only so older checkpoints can still be inspected.
 
 The reference PyTorch project standardizes its Fourier data using mean and standard deviation computed from a finite training set. This online variant does not use dataset-wide standardization; `log1p` compresses the spectral dynamic range and the balanced reconstruction loss normalizes each sample's error by its RMS spectral amplitude.
 

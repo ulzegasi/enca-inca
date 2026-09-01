@@ -46,9 +46,6 @@ RUNSTAMP=$(date +%Y%m%d)
 export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_${MODEL}_z${LATENT_TAG}
 mkdir -p "$ENCA_FOURIER_CNN_LOGDIR"
 
-# Use an empty string for the original transform or "Hann" for Hann windowing.
-WINDOW=""
-
 export TF_CPP_MIN_LOG_LEVEL=3
 export TF_ENABLE_ONEDNN_OPTS=0
 
@@ -69,7 +66,6 @@ julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "MODEL=$MODEL"
 echo "ENCA_FOURIER_CNN_LOGDIR=$ENCA_FOURIER_CNN_LOGDIR"
-echo "WINDOW=${WINDOW:-none (legacy)}"
 python -c "import sdde_model; print('Canonical SDDE model:', sdde_model.__file__)"
 nvidia-smi || true
 
@@ -77,4 +73,4 @@ nvidia-smi || true
 # Run
 # ==============================
 srun --export=ALL,MODEL="$MODEL",ENCA_FOURIER_CNN_LOGDIR="$ENCA_FOURIER_CNN_LOGDIR" --cpu-bind=cores \
-    python train_ENCAFourierCNN_model3.py --window "$WINDOW"
+    python train_ENCAFourierCNN_model3.py

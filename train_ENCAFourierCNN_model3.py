@@ -30,7 +30,6 @@ import datetime
 import numpy as np
 import sys
 import json
-import argparse
 import logging
 import time
 
@@ -65,11 +64,11 @@ def validate_window(window):
     return window
 
 
-def timeseries_to_fourier_log_amplitude(x, num_fft_components, window=""):
+def timeseries_to_fourier_log_amplitude(x, num_fft_components, window="Hann"):
     """Map [batch, time, 1] signals to log1p rFFT magnitudes [batch, n_fft, 1].
 
-    An empty ``window`` preserves the original ENCA Fourier-CNN transform.
-    ``window='Hann'`` applies a symmetric Hann window before the rFFT.
+    New training always uses the default symmetric Hann window. An explicit
+    empty value remains supported only when inspecting a legacy checkpoint.
     """
     validate_window(window)
     x = tf.convert_to_tensor(x, dtype=tf.float32)
@@ -284,7 +283,7 @@ class Manage_Hyper_Parameters:
 
 ##################################################################################################
 class ExpSetup:
-    def __init__(self, window=""):
+    def __init__(self):
         self.model = os.environ.get("MODEL", "original").strip().lower()
         if self.model not in {"original", "jupiter"}:
             raise ValueError(
@@ -313,7 +312,8 @@ class ExpSetup:
                 f"model={self.model!r}."
             )
         self.num_fft_components = 100
-        self.window = validate_window(window)
+        # Fourier-CNN ENCA always uses the symmetric Hann preprocessing.
+        self.window = "Hann"
         self.representation_mode = "enca_fft_cnn"
         self.simulation_backend = (
             src.generators.DataGenerator_SolarDynamo_SDDE_Canonical.simulation_backend
@@ -363,22 +363,9 @@ class ExpSetup:
         self.Aj_lims = (0.0, 0.1)
 
 ##################################################################################################
-def parse_command_line_args():
-    parser = argparse.ArgumentParser(description="Train the ENCA Fourier-CNN model.")
-    parser.add_argument(
-        "--window",
-        default="",
-        choices=VALID_WINDOWS,
-        help="FFT window: pass an empty string for the legacy transform or 'Hann'.",
-    )
-    return parser.parse_args()
-
-
-##################################################################################################
 def main():
 
-    cli_args = parse_command_line_args()
-    args = ExpSetup(window=cli_args.window)
+    args = ExpSetup()
 
     if not os.path.isdir(args.logdir):
         os.makedirs(args.logdir)
@@ -897,8 +884,8 @@ class Sampler:
             self.args.logdir = kwargs.get('logdir')
         if not os.path.isdir(self.args.logdir):
             raise AssertionError('logdir %s from ExpSetup is not found. Quitting.' % self.args.logdir)
-        # The command-line option is relevant only while training. When a
-        # checkpoint is loaded, its saved preprocessing setting is authoritative.
+        # Checkpoint metadata remains authoritative when inspecting a legacy
+        # run; all newly trained Fourier-CNN models use Hann preprocessing.
         hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
         if hp_manager.args is None:
             raise AssertionError(
