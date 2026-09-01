@@ -316,9 +316,7 @@ class ExpSetup:
         self.window = validate_window(window)
         self.representation_mode = "enca_fft_cnn"
         self.simulation_backend = (
-            "sdde_model_sddeproblem_em_noisegrid"
-            if self.model == "jupiter"
-            else "legacy_enca_explicit_noise"
+            src.generators.DataGenerator_SolarDynamo_SDDE_Canonical.simulation_backend
         )
 
         # SDDE sim settings
@@ -392,12 +390,7 @@ def main():
 
     ##################################################################################################
     # Define a generator function for observations, parameters, and noise vectors
-    generator_class = (
-        src.generators.DataGenerator_SolarDynamo_SDDE_Canonical
-        if args.model == "jupiter"
-        else src.generators.DataGenerator_SolarDynamo_SDDE_ENCA
-    )
-    gen_train = generator_class(
+    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_Canonical(
         Tobs=args.Tobs,
         saveat=args.saveat,
         num_noise_channels=args.num_noise_channels,
@@ -584,27 +577,23 @@ def main():
     ##################################################################################################
     # Restore a previously interrupted training session (if exists)
     if save_manager.latest_checkpoint:
-        if args.model == "jupiter":
-            saved_model = (
-                getattr(hp_manager.args, "model", None)
-                if hp_manager.args is not None
-                else None
+        saved_model = (
+            getattr(hp_manager.args, "model", None)
+            if hp_manager.args is not None
+            else None
+        )
+        saved_backend = (
+            getattr(hp_manager.args, "simulation_backend", None)
+            if hp_manager.args is not None
+            else None
+        )
+        if saved_model != args.model or saved_backend != args.simulation_backend:
+            raise RuntimeError(
+                "Refusing to resume this ENCAfftCNN checkpoint because it "
+                "predates or does not use the canonical explicit-noise SDDE "
+                "contract for the selected model. Start in a new "
+                "ENCA_FOURIER_CNN_LOGDIR."
             )
-            saved_backend = (
-                getattr(hp_manager.args, "simulation_backend", None)
-                if hp_manager.args is not None
-                else None
-            )
-            if (
-                saved_model != "jupiter"
-                or saved_backend != args.simulation_backend
-            ):
-                raise RuntimeError(
-                    "Refusing to resume this ENCAfftCNN checkpoint as a "
-                    "Jupiter run because it lacks the canonical explicit-noise "
-                    "Jupiter contract. Start in a new "
-                    "ENCA_FOURIER_CNN_LOGDIR."
-                )
         hp_manager.check_args_maybe_append(args)
         ckpt.restore(save_manager.latest_checkpoint)
         print(f"Restored from {save_manager.latest_checkpoint}.")
@@ -1036,12 +1025,7 @@ class Sampler:
         if prng is None:
             prng = self.prng
 
-        generator_class = (
-            src.generators.DataGenerator_SolarDynamo_SDDE_Canonical
-            if self.args.model == 'jupiter'
-            else src.generators.DataGenerator_SolarDynamo_SDDE_ENCA
-        )
-        generator = generator_class(
+        generator = src.generators.DataGenerator_SolarDynamo_SDDE_Canonical(
             prng=prng,
             Tobs=self.args.Tobs,
             saveat=self.args.saveat,

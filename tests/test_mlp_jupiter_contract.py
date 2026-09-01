@@ -16,6 +16,47 @@ class MlpJupiterGeneratorContractTest(unittest.TestCase):
             DataGenerator_SolarDynamo_SDDE_MLP,
         )
 
+    def test_original_model_uses_canonical_explicit_noise_with_continuous_delay(self):
+        captured = {}
+
+        def fake_sn(theta, eps, **kwargs):
+            captured["theta"] = tuple(theta)
+            captured["eps"] = np.asarray(eps).copy()
+            captured["kwargs"] = kwargs
+            return np.arange(4, dtype=np.float64)
+
+        generator = DataGenerator_SolarDynamo_SDDE_Canonical(
+            prng=np.random.RandomState(2718),
+            model="original",
+            Twarmup=2,
+            Tobs=4,
+            dt=0.1,
+            saveat=1.0,
+            tau_lims=(2.0, 2.0),
+            T_lims=(3.01, 3.09),
+            Nd_lims=(8.0, 8.0),
+            sigma_lims=(0.02, 0.02),
+            Bmax_lims=(10.0, 10.0),
+        )
+
+        with patch("sdde_model.sn_from_noise", side_effect=fake_sn):
+            observation, targets, noise = next(iter(generator))
+
+        self.assertEqual(observation.shape, (4, 1))
+        self.assertEqual(targets.shape, (5,))
+        self.assertEqual(len(captured["theta"]), 5)
+        self.assertEqual(captured["eps"].shape, (60,))
+        self.assertEqual(noise.shape, (4, 1))
+        np.testing.assert_array_equal(noise[:, 0], captured["eps"][20::10][:4])
+        self.assertGreater(
+            abs(float(targets[1]) / 0.1 - round(float(targets[1]) / 0.1)),
+            1e-5,
+        )
+        self.assertEqual(
+            generator.simulation_backend,
+            "sdde_model_sddeproblem_em_noisegrid_v2",
+        )
+
     def test_phase_goes_to_solver_but_not_regression_targets(self):
         captured = {}
 

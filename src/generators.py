@@ -365,7 +365,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
     omitted from ``params``.
     """
 
-    simulation_backend = "sdde_model_sddeproblem_em_noisegrid"
+    simulation_backend = "sdde_model_sddeproblem_em_noisegrid_v2"
 
     def _sample_theta(self):
         # The canonical delay solver supports a continuous delay.  Sampling T
@@ -391,7 +391,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             )
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
-                "MLP SDDE simulation requires the canonical 'sdde-model' "
+                "Neural SDDE simulation requires the canonical 'sdde-model' "
                 "package used by SABC. Install the SDDE-model repository in "
                 "the active environment (for example, pip install -e "
                 "/path/to/SDDE-model)."
@@ -453,7 +453,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             noise_1d = eps_obs[::self.noise_stride][:self.L]
             if noise_1d.shape[0] != self.L:
                 raise ValueError(
-                    f"Downsampled MLP noise has length {noise_1d.shape[0]}, "
+                    f"Downsampled canonical noise has length {noise_1d.shape[0]}, "
                     f"expected {self.L}."
                 )
             noise = noise_1d.reshape(self.L, 1)

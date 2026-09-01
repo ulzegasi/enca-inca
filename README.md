@@ -92,6 +92,10 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 - the latent width remains configured directly as `self.ndims_latent` in
   `ExpSetup`; if it is set above six for Jupiter, every additional coordinate
   is retained as a free SABC statistic
+- original-model MLP and ENCAfftCNN training also use the canonical
+  `SDDEProblem + EM() + NoiseGrid` path; legacy original neural checkpoints
+  must be retrained in fresh directories before repeating neural-statistics
+  inference
 - default output directory: `sdde_ENCAFourierCNN_runs/`
 - logdir override: `ENCA_FOURIER_CNN_LOGDIR=/path/to/run`
 - GPU cluster launcher: `runtraining_gpu_encafouriercnn.sh`

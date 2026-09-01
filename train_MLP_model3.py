@@ -258,7 +258,9 @@ class ExpSetup:
                 f"model={self.model!r}."
             )
         self.num_noise_channels = 1
-        self.simulation_backend = "sdde_model_sddeproblem_em_noisegrid"
+        self.simulation_backend = (
+            src.generators.DataGenerator_SolarDynamo_SDDE_MLP.simulation_backend
+        )
         self.representation_mode = "fourier_amplitude"
         self.num_fft_components = 100
         self.fft_log_eps = 1e-8
