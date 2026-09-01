@@ -11,8 +11,8 @@ import argparse
 import datetime
 import json
 import numpy as np
-# IMPORTANT: init_julia() must happen before importing tensorflow
-from julia_bootstrap import init_julia
+# IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
+from sdde_model import init_julia
 init_julia()
 
 import matplotlib
@@ -22,9 +22,6 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 
 import src.generators
-
-
-PARAM_NAMES = ["tau", "T", "Nd", "sigma", "Bmax"]
 
 
 def _as_tuple(x):
@@ -55,6 +52,8 @@ def find_latest_checkpoint(logdir: str, ckpt_prefix: str) -> str:
 def build_encoder_decoder(
     ndims_latent: int,
     num_fft_components: int,
+    len_timeseries: int,
+    num_noise_channels: int,
 ):
     x_input = tf.keras.layers.Input(shape=[num_fft_components], name="fft_amplitudes")
     x = tf.keras.layers.Dense(256, activation="relu", name="enc_dense_1")(x_input)
@@ -64,11 +63,22 @@ def build_encoder_decoder(
     encoder = tf.keras.Model(inputs=x_input, outputs=z)
 
     latent_mappings = tf.keras.layers.Input(shape=[ndims_latent], name="latent_representations")
-    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(latent_mappings)
+    noise_vectors = tf.keras.layers.Input(
+        shape=[len_timeseries, num_noise_channels], name="noise_vectors"
+    )
+    noise_zero = tf.keras.layers.Lambda(
+        lambda n: tf.zeros_like(tf.reduce_sum(n, axis=[1, 2])),
+        name="noise_interface_zero",
+    )(noise_vectors)
+    decoder_input = tf.keras.layers.Lambda(
+        lambda values: values[0] + values[1][:, tf.newaxis],
+        name="attach_noise_interface",
+    )([latent_mappings, noise_zero])
+    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(decoder_input)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_2")(y)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_3")(y)
     y = tf.keras.layers.Dense(num_fft_components, activation=None, name="pred_fft_amplitudes")(y)
-    decoder = tf.keras.Model(inputs=latent_mappings, outputs=y)
+    decoder = tf.keras.Model(inputs=[latent_mappings, noise_vectors], outputs=y)
     return encoder, decoder
 
 
@@ -85,8 +95,8 @@ def timeseries_to_fft_log_amplitudes_np(
     return np.log(amplitudes[:, :num_fft_components] + fft_log_eps).astype(np.float32)
 
 
-def validate_params(theta, hp):
-    tau, T, Nd, sigma, Bmax = theta
+def validate_params(theta, hp, model):
+    tau, T, Nd, sigma, Bmax = theta[:5]
     lims = [
         ("tau", tau, _as_tuple(hp["tau_lims"])),
         ("T", T, _as_tuple(hp["T_lims"])),
@@ -94,14 +104,11 @@ def validate_params(theta, hp):
         ("sigma", sigma, _as_tuple(hp["sigma_lims"])),
         ("Bmax", Bmax, _as_tuple(hp["Bmax_lims"])),
     ]
+    if model == "jupiter":
+        lims.append(("Aj", theta[5], _as_tuple(hp.get("Aj_lims", (0.0, 0.1)))))
     for name, value, (lo, hi) in lims:
         if not (lo <= value <= hi):
             raise ValueError(f"{name}={value} is outside saved prior [{lo}, {hi}]")
-
-    dt = float(hp["dt"])
-    steps = round(T / dt)
-    if abs(T - steps * dt) > 1e-9:
-        raise ValueError(f"T={T} must be a multiple of dt={dt}")
 
 
 def relative_chisq(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -128,6 +135,7 @@ def main():
     ap.add_argument("--Nd", type=float, required=True)
     ap.add_argument("--sigma", type=float, required=True)
     ap.add_argument("--Bmax", type=float, required=True)
+    ap.add_argument("--Aj", type=float, default=None, help="Jupiter modulation amplitude")
     ap.add_argument("--seed", type=int, default=1234, help="Seed for the sampled driving noise")
     ap.add_argument("--nseeds", type=int, default=1, help="How many noise realizations to aggregate")
     ap.add_argument("--outdir", default=None, help="Where to save plots (default: <run>/diagnostics)")
@@ -145,8 +153,17 @@ def main():
     ckpt_prefix = "model_ckpt" if args.last else "model_best_ckpt"
     hp = load_hparams(run_dir)
 
+    model = str(hp.get("model", "original")).strip().lower()
+    if model not in {"original", "jupiter"}:
+        raise ValueError(f"Unknown saved SDDE model {model!r}.")
+    if model == "jupiter" and args.Aj is None:
+        raise ValueError("A Jupiter run requires --Aj.")
+    if model == "original" and args.Aj is not None:
+        raise ValueError("--Aj may only be used with a Jupiter run.")
     theta = (args.tau, args.T, args.Nd, args.sigma, args.Bmax)
-    validate_params(theta, hp)
+    if model == "jupiter":
+        theta += (args.Aj,)
+    validate_params(theta, hp, model)
     if args.nseeds < 1:
         raise ValueError("--nseeds must be >= 1")
 
@@ -173,6 +190,8 @@ def main():
     encoder, decoder = build_encoder_decoder(
         ndims_latent=ndims_latent,
         num_fft_components=num_fft_components,
+        len_timeseries=len_timeseries,
+        num_noise_channels=num_noise_channels,
     )
     ckpt = tf.train.Checkpoint(encoder=encoder, decoder=decoder)
     ckpt_path = find_latest_checkpoint(run_dir, ckpt_prefix=ckpt_prefix)
@@ -193,7 +212,7 @@ def main():
 
     for i in range(args.nseeds):
         prng = np.random.RandomState(args.seed + i)
-        gen = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+        gen = src.generators.DataGenerator_SolarDynamo_SDDE_MLP(
             prng=prng,
             Tobs=Tobs,
             saveat=saveat,
@@ -205,6 +224,9 @@ def main():
             Nd_lims=(args.Nd, args.Nd),
             sigma_lims=(args.sigma, args.sigma),
             Bmax_lims=(args.Bmax, args.Bmax),
+            Aj_lims=(args.Aj, args.Aj) if model == "jupiter" else (0.0, 0.1),
+            model=model,
+            jupiter_period=float(hp.get("jupiter_period", 11.86)),
         )
 
         x_true, params_i, noise = next(iter(gen))
@@ -219,7 +241,8 @@ def main():
         )
 
         z_latent = encoder(x_batch, training=False).numpy()
-        x_pred = decoder(z_latent, training=False).numpy()[0]
+        noise_batch = noise[np.newaxis, ...].astype(np.float32)
+        x_pred = decoder([z_latent, noise_batch], training=False).numpy()[0]
         x_true_vec = x_batch[0]
 
         x_true_all[i, :] = x_true_vec
@@ -262,7 +285,9 @@ def main():
 
     summary = (
         f"tau={params_true[0]:.4g}, T={params_true[1]:.4g}, Nd={params_true[2]:.4g}, "
-        f"sigma={params_true[3]:.4g}, Bmax={params_true[4]:.4g}\n"
+        f"sigma={params_true[3]:.4g}, Bmax={params_true[4]:.4g}"
+        + (f", Aj={params_true[5]:.4g}" if model == "jupiter" else "")
+        + "\n"
         f"mean RMSE={rmse:.4g}, flat baseline RMSE={flat_mean_rmse:.4g}, "
         f"performance={performance_vs_flat_mean:.4g}, mean relative_chisq={chi:.4g}, "
         f"seeds={args.seed}..{args.seed + args.nseeds - 1} (n={args.nseeds})"
@@ -286,6 +311,7 @@ def main():
         f"Nd{_fmt_tag_value(args.Nd)}_"
         f"sig{_fmt_sigma_tag(args.sigma)}_"
         f"B{_fmt_tag_value(args.Bmax)}"
+        + (f"_Aj{_fmt_tag_value(args.Aj, scale=100)}" if model == "jupiter" else "")
     )
     out_png = os.path.join(outdir, f"recon_{ckpt_prefix}_step{step}_{param_tag}_{stamp}.png")
     fig.savefig(out_png, dpi=160)
@@ -294,10 +320,13 @@ def main():
     print(f"[OK] Restored: {ckpt_path}")
     print(f"[OK] Saved plot: {out_png}")
     print("Parameters:")
-    print(
+    parameter_text = (
         f"  tau={params_true[0]:.6g}  T={params_true[1]:.6g}  Nd={params_true[2]:.6g}  "
         f"sigma={params_true[3]:.6g}  Bmax={params_true[4]:.6g}"
     )
+    if model == "jupiter":
+        parameter_text += f"  Aj={params_true[5]:.6g}"
+    print(parameter_text)
     flat_mean_name = "flat_mean_spectrum"
     print(
         f"Metrics: mean_RMSE={rmse:.6g}  mean_relative_chisq={chi:.6g}  "

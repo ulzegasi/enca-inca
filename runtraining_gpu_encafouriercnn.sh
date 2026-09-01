@@ -27,6 +27,12 @@
 
 module load cuda/11.6.2
 
+# SDDE variant. The latent width remains hard-coded in
+# train_ENCAFourierCNN_model3.py; keep LATENT_TAG synchronized with it for the
+# run-directory name only.
+export MODEL="jupiter"
+LATENT_TAG=6
+
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
 mkdir -p "$JULIA_DEPOT_PATH"
 
@@ -34,9 +40,10 @@ mkdir -p "$TMPDIR"
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
 mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs
 
-# RUNSTAMP=$(date +%Y%m%d)  # Fresh run
-RUNSTAMP=20260807           # Continuation
-export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_z6
+# Jupiter training must use a fresh run directory. Replace the automatic stamp
+# only when continuing a checkpoint created with the same model and backend.
+RUNSTAMP=$(date +%Y%m%d)
+export ENCA_FOURIER_CNN_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourierCNN_runs/${RUNSTAMP}_encafouriercnn_${MODEL}_z${LATENT_TAG}
 mkdir -p "$ENCA_FOURIER_CNN_LOGDIR"
 
 # Use an empty string for the original transform or "Hann" for Hann windowing.
@@ -60,12 +67,14 @@ echo "Julia depot: $JULIA_DEPOT_PATH"
 echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "MODEL=$MODEL"
 echo "ENCA_FOURIER_CNN_LOGDIR=$ENCA_FOURIER_CNN_LOGDIR"
 echo "WINDOW=${WINDOW:-none (legacy)}"
+python -c "import sdde_model; print('Canonical SDDE model:', sdde_model.__file__)"
 nvidia-smi || true
 
 # ==============================
 # Run
 # ==============================
-srun --export=ALL,ENCA_FOURIER_CNN_LOGDIR="$ENCA_FOURIER_CNN_LOGDIR" --cpu-bind=cores \
+srun --export=ALL,MODEL="$MODEL",ENCA_FOURIER_CNN_LOGDIR="$ENCA_FOURIER_CNN_LOGDIR" --cpu-bind=cores \
     python train_ENCAFourierCNN_model3.py --window "$WINDOW"

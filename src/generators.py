@@ -346,6 +346,125 @@ class DataGenerator_SolarDynamo_SDDE_ENCA:
                 noise = np.repeat(noise, self.num_noise_channels, axis=1)
 
             yield (x, params, noise)
+
+
+class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
+    """Canonical explicit-noise SDDE samples for neural training/diagnostics.
+
+    This generator deliberately delegates simulation to the installed
+    :mod:`sdde_model` package, which is also the forward-model implementation
+    used by SABC. It preserves the ENCA-style ``(x, params, noise)`` contract:
+    the bare Gaussian increments are generated independently, used to create
+    ``x``, and returned for decoder conditioning. The current MLP decoder does
+    not consume them, but keeping the data path intact permits a future
+    noise-conditioned decoder without changing the simulator contract.
+
+    For the Jupiter model, ``params`` contains the six inference parameters
+    ``(tau, T, Nd, sigma, Bmax, Aj)``.  A fresh phase is sampled for every
+    realization and passed to the seven-input simulator, but is intentionally
+    omitted from ``params``.
+    """
+
+    simulation_backend = "sdde_model_sddeproblem_em_noisegrid"
+
+    def _sample_theta(self):
+        # The canonical delay solver supports a continuous delay.  Sampling T
+        # continuously also matches the SABC prior; quantization is needed only
+        # by the hand-written, noise-conditioned ENCA stepping scheme above.
+        theta = (
+            float(self.prng.uniform(*self.tau_lims)),
+            float(self.prng.uniform(*self.T_lims)),
+            float(self.prng.uniform(*self.Nd_lims)),
+            float(self.prng.uniform(*self.sigma_lims)),
+            float(self.prng.uniform(*self.Bmax_lims)),
+        )
+        if self.model == "jupiter":
+            theta += (float(self.prng.uniform(*self.Aj_lims)),)
+        return theta
+
+    def __iter__(self):
+        try:
+            from sdde_model import sn_from_noise as sn_from_noise_original
+            from sdde_model.solar_dynamo_jupiter import (
+                JUPITER_ORBITAL_PERIOD_YEARS,
+                sn_from_noise as sn_from_noise_jupiter,
+            )
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "MLP SDDE simulation requires the canonical 'sdde-model' "
+                "package used by SABC. Install the SDDE-model repository in "
+                "the active environment (for example, pip install -e "
+                "/path/to/SDDE-model)."
+            ) from exc
+
+        if self.model == "jupiter" and not np.isclose(
+            self.jupiter_period, JUPITER_ORBITAL_PERIOD_YEARS, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError(
+                "The canonical Jupiter integrator fixes the orbital period at "
+                f"{JUPITER_ORBITAL_PERIOD_YEARS} years, but jupiter_period="
+                f"{self.jupiter_period} was requested."
+            )
+
+        while True:
+            theta = self._sample_theta()
+            Tsim = self.Twarmup + self.Tobs
+            n_increments = int(round(Tsim / self.dt))
+            if abs(n_increments * self.dt - Tsim) > 1e-9:
+                raise ValueError(
+                    f"Tsim ({Tsim}) must be divisible by dt ({self.dt})."
+                )
+            eps_dt = self.prng.normal(0.0, 1.0, size=n_increments).astype(np.float32)
+
+            if self.model == "jupiter":
+                phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
+                # sdde_model's canonical simulator API accepts the six inferred
+                # parameters plus the nuisance phase as its seventh input.
+                theta_simulator = theta + (phase,)
+                y = sn_from_noise_jupiter(
+                    theta_simulator,
+                    eps_dt,
+                    Twarmup=self.Twarmup,
+                    Tobs=self.Tobs,
+                    dt=self.dt,
+                    saveat=self.saveat,
+                )
+            else:
+                y = sn_from_noise_original(
+                    theta,
+                    eps_dt,
+                    Twarmup=self.Twarmup,
+                    Tobs=self.Tobs,
+                    dt=self.dt,
+                    saveat=self.saveat,
+                )
+
+            y = np.asarray(y, dtype=np.float32).reshape(-1)
+            if y.shape[0] != self.L:
+                raise ValueError(
+                    f"Canonical SDDE simulator returned {y.shape[0]} samples; "
+                    f"expected {self.L} from Tobs={self.Tobs}, saveat={self.saveat}."
+                )
+
+            x = y.reshape(self.L, 1)
+            params = np.asarray(theta, dtype=np.float32)
+
+            eps_obs = eps_dt[self.warmup_steps:]
+            noise_1d = eps_obs[::self.noise_stride][:self.L]
+            if noise_1d.shape[0] != self.L:
+                raise ValueError(
+                    f"Downsampled MLP noise has length {noise_1d.shape[0]}, "
+                    f"expected {self.L}."
+                )
+            noise = noise_1d.reshape(self.L, 1)
+            if self.num_noise_channels > 1:
+                noise = np.repeat(noise, self.num_noise_channels, axis=1)
+            yield x, params, noise
+
+
+# The canonical explicit-noise contract is shared by MLP and Fourier-CNN ENCA.
+# Keep the older MLP name as a compatibility alias for existing scripts.
+DataGenerator_SolarDynamo_SDDE_Canonical = DataGenerator_SolarDynamo_SDDE_MLP
             
 
 class DataGenerator_SolarDynamo_SDDE_INCA:

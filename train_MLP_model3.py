@@ -3,12 +3,15 @@
 # This training pipeline uses an MLP autoencoder on Hann-windowed log FFT
 # amplitudes of solar-dynamo / SDDE time series.
 
-# IMPORTANT: init_julia() must happen before importing tensorflow, 
+# IMPORTANT: init_julia() must happen before importing tensorflow,
 # otherwise there will be a conflict in the shared libraries used by both.
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-from julia_bootstrap import init_julia
+# Use the same packaged SDDE implementation as SABC.  This is intentionally
+# not the repository-local Julia bridge: sdde_model is the canonical forward
+# model shared by training and inference.
+from sdde_model import init_julia
 init_julia()
 
 import tensorflow as tf
@@ -81,11 +84,27 @@ class Architecture:
         '''latent_mappings size: [bs, #ndims_latent]
         output: [bs, #num_fft_components]'''
         latent_mappings = tf.keras.layers.Input(shape=[self.ndims_latent], name='latent_representations')
-        x = tf.keras.layers.Dense(128, activation='relu', name='dec_dense_1')(latent_mappings)
+        noise_vectors = tf.keras.layers.Input(
+            shape=[self.len_timeseries, self.num_noise_channels],
+            name='noise_vectors',
+        )
+        # Keep noise as an explicit decoder input without changing the current
+        # MLP mapping. This zero-valued connection preserves the interface for
+        # a future noise-conditioned decoder and guarantees that the same bare
+        # noise remains attached to the observation throughout the pipeline.
+        noise_zero = tf.keras.layers.Lambda(
+            lambda n: tf.zeros_like(tf.reduce_sum(n, axis=[1, 2])),
+            name='noise_interface_zero',
+        )(noise_vectors)
+        decoder_input = tf.keras.layers.Lambda(
+            lambda values: values[0] + values[1][:, tf.newaxis],
+            name='attach_noise_interface',
+        )([latent_mappings, noise_zero])
+        x = tf.keras.layers.Dense(128, activation='relu', name='dec_dense_1')(decoder_input)
         x = tf.keras.layers.Dense(256, activation='relu', name='dec_dense_2')(x)
         x = tf.keras.layers.Dense(256, activation='relu', name='dec_dense_3')(x)
         x = tf.keras.layers.Dense(self.num_fft_components, activation=None, name='pred_fft_amplitudes')(x)
-        return tf.keras.Model(inputs=latent_mappings, outputs=x)
+        return tf.keras.Model(inputs=[latent_mappings, noise_vectors], outputs=x)
 
 ##################################################################################################
 class Args_:
@@ -229,8 +248,17 @@ class ExpSetup:
         self.logdir = os.environ.get("MLP_LOGDIR", default_logdir)
 
         self.num_model_parameters = 6 if self.model == "jupiter" else 5
-        self.ndims_latent = self.num_model_parameters
+        self.ndims_latent = int(
+            os.environ.get("NDIMS_LATENT", self.num_model_parameters)
+        )
+        if self.ndims_latent < self.num_model_parameters:
+            raise ValueError(
+                f"ndims_latent={self.ndims_latent} cannot hold the "
+                f"{self.num_model_parameters} supervised parameters for "
+                f"model={self.model!r}."
+            )
         self.num_noise_channels = 1
+        self.simulation_backend = "sdde_model_sddeproblem_em_noisegrid"
         self.representation_mode = "fourier_amplitude"
         self.num_fft_components = 100
         self.fft_log_eps = 1e-8
@@ -296,8 +324,10 @@ def main():
         tf.config.experimental.set_memory_growth(gpu_instance, True)
 
     ##################################################################################################
-    # Define a generator function for observations, parameters, and noise vectors
-    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+    # MLP training uses the same packaged explicit-noise EM simulator as SABC.
+    # Bare noise remains attached to the batch/decoder interface even though
+    # the current MLP decoder does not consume it.
+    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_MLP(
         Tobs=args.Tobs,
         saveat=args.saveat,
         num_noise_channels=args.num_noise_channels,
@@ -500,11 +530,22 @@ def main():
 
     ##################################################################################################
     # Restore a previously interrupted training session (if exists)
-    ckpt.restore(save_manager.latest_checkpoint)
     if save_manager.latest_checkpoint:
-        print(f"Restored from {save_manager.latest_checkpoint}.")
-        # Double check if experiment setup matches the one in the saved chkpt dir
+        saved_backend = (
+            getattr(hp_manager.args, "simulation_backend", None)
+            if hp_manager.args is not None
+            else None
+        )
+        if saved_backend != args.simulation_backend:
+            raise RuntimeError(
+                "Refusing to resume this MLP checkpoint because it predates or "
+                "does not use the canonical explicit-noise SDDE backend. Start "
+                "the corrected training in a new MLP_LOGDIR."
+            )
+        # Validate the complete experiment contract before restoring weights.
         hp_manager.check_args_maybe_append(args)
+        ckpt.restore(save_manager.latest_checkpoint)
+        print(f"Restored from {save_manager.latest_checkpoint}.")
     else:
         print("Initializing training from scratch. \nLogdir: %s" % args.logdir)
         # Dump hyper-parameters to ckpt dir for future reference. 
@@ -532,10 +573,10 @@ def main():
     # wrap a training step for performance gains.
     @tf.function
     def train_step(model, x, params, noise, optimizer):
-        """Single training step (no logging inside)."""
+        """Single training step; noise is retained for decoder compatibility."""
         with tf.GradientTape(persistent=False) as tape:
             z_latent = model.encoder(x, training=True)
-            x_reconst = model.decoder(z_latent, training=True)
+            x_reconst = model.decoder([z_latent, noise], training=True)
 
             if args.loss_mode == "legacy_chisq":
                 dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
@@ -606,6 +647,7 @@ def main():
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
     print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
+    print(f"simulation backend: {args.simulation_backend}")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
     # --- warm up tf.function tracing/compilation ---
@@ -829,14 +871,13 @@ class Sampler:
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32) #creating minibatch size 1.
             x_i = self.timeseries_to_fft_log_amplitudes_np(x_i)
-            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
+            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32)
             o_latent = self.model_obj.encoder(x_i, training=False).numpy()
             summary_space[i,...] = o_latent
             ndarray_noise_timeseries[i,...] = noise_i
         if return_noise_vectors:
             return summary_space, ndarray_noise_timeseries
-        else:
-            return summary_space
+        return summary_space
 
     def encode(self, samples):
         '''Function generates latent representations of the given observations (samples).
@@ -860,15 +901,17 @@ class Sampler:
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32) #creating minibatch size 1.
             x_i = self.timeseries_to_fft_log_amplitudes_np(x_i)
+            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32)
             z_latent = self.model_obj.encoder(x_i, training=False)
-            o_reconst = self.model_obj.decoder(z_latent, training=False).numpy()
+            o_reconst = self.model_obj.decoder([z_latent, noise_i], training=False).numpy()
             ndarray_timeseries[i,...] = np.squeeze(o_reconst)
         return ndarray_timeseries
 
     def decode(self, tuple_summary_and_noise):
         '''Function reconstruct timeseries for a given tuple of (latent_representations, noise vectors).'''
         o_latent = tuple_summary_and_noise[0]
-        return self.model_obj.decoder(o_latent, training=False).numpy()
+        o_noise = tuple_summary_and_noise[1]
+        return self.model_obj.decoder([o_latent, o_noise], training=False).numpy()
 
     def check_hyper_params(self):
         hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
@@ -906,7 +949,7 @@ class Sampler:
         if prng is None:
             prng = self.prng
 
-        generator = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+        generator = src.generators.DataGenerator_SolarDynamo_SDDE_MLP(
             prng=prng,
             Tobs=self.args.Tobs,
             saveat=self.args.saveat,

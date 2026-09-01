@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-#SBATCH --job-name=mlp3z8cpu
+#SBATCH --job-name=mlp3cpu
 #SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
 #SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
@@ -24,6 +24,14 @@
 
 . /cfs/earth/scratch/ulzg/enca-inca/load_encainca_env.sh
 
+export MODEL="${MODEL:-original}"
+if [[ "$MODEL" == "jupiter" ]]; then
+  default_latent_width=6
+else
+  default_latent_width=5
+fi
+export NDIMS_LATENT="${NDIMS_LATENT:-$default_latent_width}"
+
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
 mkdir -p "$JULIA_DEPOT_PATH"
 
@@ -34,7 +42,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
-export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_z8_1_cpu
+export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_${MODEL}_z${NDIMS_LATENT}_1_cpu
 mkdir -p "$MLP_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
@@ -56,7 +64,10 @@ echo "Julia depot: $JULIA_DEPOT_PATH"
 echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "MODEL=$MODEL"
+echo "NDIMS_LATENT=$NDIMS_LATENT"
 echo "MLP_LOGDIR=$MLP_LOGDIR"
+python -c "import sdde_model; print('Canonical SDDE model:', sdde_model.__file__)"
 python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
 
 # ==============================

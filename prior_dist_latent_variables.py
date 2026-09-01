@@ -18,8 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
-# IMPORTANT: Julia must be initialized before TensorFlow is imported.
-from julia_bootstrap import init_julia
+# IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
+from sdde_model import init_julia
 
 init_julia()
 
@@ -33,7 +33,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import src.generators
 
 
-PARAM_NAMES = ("tau", "T", "Nd", "sigma", "Bmax")
+BASE_PARAM_NAMES = ("tau", "T", "Nd", "sigma", "Bmax")
 DEFAULT_MODEL = "20260611_mlp_z6_1"
 
 
@@ -118,7 +118,12 @@ def find_latest_checkpoint(run_dir: Path, prefix: str) -> str:
     return str(Path(max(candidates, key=checkpoint_step)).with_suffix(""))
 
 
-def build_encoder_decoder(ndims_latent: int, num_fft_components: int):
+def build_encoder_decoder(
+    ndims_latent: int,
+    num_fft_components: int,
+    len_timeseries: int,
+    num_noise_channels: int,
+):
     """Recreate the architecture used by train_MLP_model3.py."""
     x_input = tf.keras.layers.Input(
         shape=[num_fft_components], name="fft_amplitudes"
@@ -132,13 +137,24 @@ def build_encoder_decoder(ndims_latent: int, num_fft_components: int):
     z_input = tf.keras.layers.Input(
         shape=[ndims_latent], name="latent_representations"
     )
-    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(z_input)
+    noise_vectors = tf.keras.layers.Input(
+        shape=[len_timeseries, num_noise_channels], name="noise_vectors"
+    )
+    noise_zero = tf.keras.layers.Lambda(
+        lambda n: tf.zeros_like(tf.reduce_sum(n, axis=[1, 2])),
+        name="noise_interface_zero",
+    )(noise_vectors)
+    decoder_input = tf.keras.layers.Lambda(
+        lambda values: values[0] + values[1][:, tf.newaxis],
+        name="attach_noise_interface",
+    )([z_input, noise_zero])
+    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(decoder_input)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_2")(y)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_3")(y)
     y = tf.keras.layers.Dense(
         num_fft_components, activation=None, name="pred_fft_amplitudes"
     )(y)
-    decoder = tf.keras.Model(inputs=z_input, outputs=y)
+    decoder = tf.keras.Model(inputs=[z_input, noise_vectors], outputs=y)
     return encoder, decoder
 
 
@@ -177,9 +193,9 @@ def load_observed_sn(data_path: Path, expected_length: int):
     return years, values
 
 
-def latent_label(index: int) -> str:
-    if index < len(PARAM_NAMES):
-        return rf"$z_{index + 1}$ ({PARAM_NAMES[index]})"
+def latent_label(index: int, param_names) -> str:
+    if index < len(param_names):
+        return rf"$z_{index + 1}$ ({param_names[index]})"
     return rf"$z_{index + 1}$ (free)"
 
 
@@ -222,6 +238,7 @@ def plot_last_latent_triplets(
     output_path: Path,
     *,
     prior_limits: dict,
+    param_names,
     observed_z: np.ndarray | None,
     title: str,
     dpi: int,
@@ -256,14 +273,13 @@ def plot_last_latent_triplets(
         ax = fig.add_subplot(
             grid[row, column], projection="3d", computed_zorder=False
         )
-        x_limits = prior_limits[PARAM_NAMES[i]]
-        y_limits = prior_limits[PARAM_NAMES[j]]
-        in_prior = (
-            (z[:, i] >= x_limits[0])
-            & (z[:, i] <= x_limits[1])
-            & (z[:, j] >= y_limits[0])
-            & (z[:, j] <= y_limits[1])
-        )
+        x_prior = prior_limits[param_names[i]] if i < len(param_names) else None
+        y_prior = prior_limits[param_names[j]] if j < len(param_names) else None
+        in_prior = np.ones(z.shape[0], dtype=bool)
+        if x_prior is not None:
+            in_prior &= (z[:, i] >= x_prior[0]) & (z[:, i] <= x_prior[1])
+        if y_prior is not None:
+            in_prior &= (z[:, j] >= y_prior[0]) & (z[:, j] <= y_prior[1])
         if np.any(in_prior):
             ax.scatter(
                 z[in_prior, i],
@@ -293,7 +309,8 @@ def plot_last_latent_triplets(
             )
             ax.legend(loc="upper right", fontsize=6, framealpha=0.8)
 
-        add_prior_prism(ax, x_limits, y_limits, (z_axis_min, z_axis_max))
+        if x_prior is not None and y_prior is not None:
+            add_prior_prism(ax, x_prior, y_prior, (z_axis_min, z_axis_max))
         if observed_z is not None:
             ax.scatter(
                 observed_z[i],
@@ -311,12 +328,14 @@ def plot_last_latent_triplets(
             ax.legend(loc="upper right", fontsize=7, framealpha=0.85)
         x_values = z[:, i] if observed_z is None else np.append(z[:, i], observed_z[i])
         y_values = z[:, j] if observed_z is None else np.append(z[:, j], observed_z[j])
-        ax.set_xlim(min(float(x_values.min()), x_limits[0]), max(float(x_values.max()), x_limits[1]))
-        ax.set_ylim(min(float(y_values.min()), y_limits[0]), max(float(y_values.max()), y_limits[1]))
+        x_reference = x_prior or (float(x_values.min()), float(x_values.max()))
+        y_reference = y_prior or (float(y_values.min()), float(y_values.max()))
+        ax.set_xlim(min(float(x_values.min()), x_reference[0]), max(float(x_values.max()), x_reference[1]))
+        ax.set_ylim(min(float(y_values.min()), y_reference[0]), max(float(y_values.max()), y_reference[1]))
         ax.set_zlim(z_axis_min, z_axis_max)
-        ax.set_xlabel(latent_label(i), labelpad=7)
-        ax.set_ylabel(latent_label(j), labelpad=7)
-        ax.set_zlabel(latent_label(last_index), labelpad=7)
+        ax.set_xlabel(latent_label(i, param_names), labelpad=7)
+        ax.set_ylabel(latent_label(j, param_names), labelpad=7)
+        ax.set_zlabel(latent_label(last_index, param_names), labelpad=7)
         ax.set_title(rf"$(z_{i + 1}, z_{j + 1}, z_{last_index + 1})$", pad=4)
         ax.view_init(elev=24, azim=-58)
         ax.tick_params(labelsize=7, pad=1)
@@ -335,6 +354,7 @@ def plot_last_latent_triplets_interactive(
     output_path: Path,
     *,
     prior_limits: dict,
+    param_names,
     observed_z: np.ndarray | None,
     title: str,
 ) -> None:
@@ -381,7 +401,7 @@ def plot_last_latent_triplets_interactive(
     )
     parameter_hover = "".join(
         f"{name}=%{{customdata[{z.shape[1] + index}]:.5g}}<br>"
-        for index, name in enumerate(PARAM_NAMES)
+        for index, name in enumerate(param_names)
     )
     hover_template = latent_hover + parameter_hover + "<extra></extra>"
     custom_data = np.column_stack((z, parameters))
@@ -391,14 +411,13 @@ def plot_last_latent_triplets_interactive(
         row, column = divmod(panel, ncols)
         row += 1
         column += 1
-        x_limits = prior_limits[PARAM_NAMES[i]]
-        y_limits = prior_limits[PARAM_NAMES[j]]
-        in_prior = (
-            (z[:, i] >= x_limits[0])
-            & (z[:, i] <= x_limits[1])
-            & (z[:, j] >= y_limits[0])
-            & (z[:, j] <= y_limits[1])
-        )
+        x_prior = prior_limits[param_names[i]] if i < len(param_names) else None
+        y_prior = prior_limits[param_names[j]] if j < len(param_names) else None
+        in_prior = np.ones(z.shape[0], dtype=bool)
+        if x_prior is not None:
+            in_prior &= (z[:, i] >= x_prior[0]) & (z[:, i] <= x_prior[1])
+        if y_prior is not None:
+            in_prior &= (z[:, j] >= y_prior[0]) & (z[:, j] <= y_prior[1])
 
         if np.any(in_prior):
             figure.add_trace(
@@ -466,22 +485,24 @@ def plot_last_latent_triplets_interactive(
                 col=column,
             )
 
-        x_lo, x_hi = x_limits
-        y_lo, y_hi = y_limits
         x_values = z[:, i] if observed_z is None else np.append(z[:, i], observed_z[i])
         y_values = z[:, j] if observed_z is None else np.append(z[:, j], observed_z[j])
+        x_reference = x_prior or (float(x_values.min()), float(x_values.max()))
+        y_reference = y_prior or (float(y_values.min()), float(y_values.max()))
+        x_lo, x_hi = x_reference
+        y_lo, y_hi = y_reference
         scene_name = "scene" if panel == 0 else f"scene{panel + 1}"
         figure.layout[scene_name].update(
             xaxis={
-                "title": f"z{i + 1} ({PARAM_NAMES[i]})",
+                "title": f"z{i + 1} ({param_names[i]})",
                 "range": [min(float(x_values.min()), x_lo), max(float(x_values.max()), x_hi)],
             },
             yaxis={
-                "title": f"z{j + 1} ({PARAM_NAMES[j]})",
+                "title": f"z{j + 1} ({param_names[j]})",
                 "range": [min(float(y_values.min()), y_lo), max(float(y_values.max()), y_hi)],
             },
             zaxis={
-                "title": latent_label(last_index).replace("$", ""),
+                "title": latent_label(last_index, param_names).replace("$", ""),
                 "range": [z_axis_min, z_axis_max],
             },
             aspectmode="cube",
@@ -520,10 +541,21 @@ def main():
         )
 
     ndims_latent = int(hp["ndims_latent"])
-    if ndims_latent not in (5, 6):
+    model = str(hp.get("model", "original")).strip().lower()
+    if model not in {"original", "jupiter"}:
+        raise ValueError(f"Unknown saved SDDE model {model!r}.")
+    param_names = BASE_PARAM_NAMES + (("Aj",) if model == "jupiter" else ())
+    num_model_parameters = int(hp.get("num_model_parameters", len(param_names)))
+    if num_model_parameters != len(param_names):
         raise ValueError(
-            "The triplet plots require ndims_latent=5 or ndims_latent=6; "
-            f"this run has {ndims_latent}"
+            f"Saved model={model!r} requires {len(param_names)} regressors, but "
+            f"num_model_parameters={num_model_parameters}."
+        )
+    if ndims_latent < num_model_parameters:
+        raise ValueError(
+            "The latent space cannot be smaller than the supervised coordinates; "
+            f"model={model!r} has {num_model_parameters} regressors but this "
+            f"run has ndims_latent={ndims_latent}."
         )
 
     num_fft_components = int(hp["num_fft_components"])
@@ -531,7 +563,7 @@ def main():
     to_tuple = lambda value: tuple(float(v) for v in value)
     prior_limits = {
         name: to_tuple(hp[f"{name}_lims"])
-        for name in PARAM_NAMES
+        for name in param_names
     }
 
     output_dir = (
@@ -545,8 +577,15 @@ def main():
     checkpoint_path = find_latest_checkpoint(run_dir, checkpoint_prefix)
     checkpoint_step = int(Path(checkpoint_path).name.rsplit("-", 1)[1])
 
-    encoder, decoder = build_encoder_decoder(ndims_latent, num_fft_components)
-    checkpoint = tf.train.Checkpoint(encoder=encoder, decoder=decoder)
+    encoder, decoder = build_encoder_decoder(
+        ndims_latent,
+        num_fft_components,
+        int(hp["len_timeseries"]),
+        int(hp["num_noise_channels"]),
+    )
+    # Only latent statistics are used below. Encoder-only restore keeps legacy
+    # encoders inspectable despite the corrected decoder's noise input.
+    checkpoint = tf.train.Checkpoint(encoder=encoder)
     for attempt in (1, 2):
         try:
             checkpoint.restore(checkpoint_path).expect_partial()
@@ -560,7 +599,7 @@ def main():
                 ) from exc
 
     prng = np.random.RandomState(args.seed)
-    generator = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+    generator = src.generators.DataGenerator_SolarDynamo_SDDE_MLP(
         prng=prng,
         Tobs=int(hp["Tobs"]),
         saveat=float(hp["saveat"]),
@@ -572,11 +611,14 @@ def main():
         Nd_lims=prior_limits["Nd"],
         sigma_lims=prior_limits["sigma"],
         Bmax_lims=prior_limits["Bmax"],
+        Aj_lims=prior_limits.get("Aj", (0.0, 0.1)),
+        model=model,
+        jupiter_period=float(hp.get("jupiter_period", 11.86)),
     )
 
     len_timeseries = int(round(float(hp["Tobs"]) / float(hp["saveat"])))
     raw = np.empty((args.nsamples, len_timeseries, 1), dtype=np.float32)
-    parameters = np.empty((args.nsamples, len(PARAM_NAMES)), dtype=np.float32)
+    parameters = np.empty((args.nsamples, len(param_names)), dtype=np.float32)
     iterator = iter(generator)
     progress_interval = max(1, min(100, args.nsamples // 10))
     print(f"Sampling {args.nsamples} prior observations (seed={args.seed}) ...")
@@ -632,7 +674,7 @@ def main():
     saved_arrays = {
         "parameters": parameters,
         "latent": latent,
-        "parameter_names": np.asarray(PARAM_NAMES),
+        "parameter_names": np.asarray(param_names),
         "checkpoint": np.asarray(checkpoint_path),
         "seed": np.asarray(args.seed),
     }
@@ -648,6 +690,7 @@ def main():
         latent,
         plot_path,
         prior_limits=prior_limits,
+        param_names=param_names,
         observed_z=observed_latent,
         title=(
             f"Prior latent distribution | {run_dir.name} | {checkpoint_prefix} "
@@ -661,6 +704,7 @@ def main():
             parameters,
             interactive_path,
             prior_limits=prior_limits,
+            param_names=param_names,
             observed_z=observed_latent,
             title=(
                 f"Prior latent distribution | {run_dir.name} | {checkpoint_prefix} "

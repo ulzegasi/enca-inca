@@ -24,9 +24,13 @@ The repository can be set up on a clean environment by creating a conda environm
 ```bash
 conda env create -f environment.yml
 conda activate encainca
+pip install -e /path/to/SDDE-model
 ```
 
 This environment currently targets Python 3.10 and TensorFlow 2.x (`tensorflow>=2.14` in `environment.yml`).
+`SDDE-model` is the canonical StochasticDelayDiffEq/EM implementation shared
+with SABC; install the same checkout in both environments so training and
+inference cannot drift between simulator implementations.
 
 For the original experiments, one can run:
 
@@ -81,6 +85,13 @@ The solar-dynamo / SDDE workflows are split by script so the architecture and da
 - decoder: project the latent vector to 100 positions, resize the simulator noise from 271 to 100 positions, concatenate both channels, then apply `Conv1D(32) -> Conv1D(32) -> Conv1D(16) -> Conv1D(1)`
 - default settings: `Tobs = 271`, `ndims_latent = 6`, batch size 300, and 1.2 million online-training steps
 - loss: balanced per-sample reconstruction MSE plus prior-width-normalized parameter regression MSE
+- Jupiter support: set `export MODEL="jupiter"` in the cluster launcher; the first six hard-coded latent
+  coordinates regress `(tau, T, Nd, sigma, Bmax, Aj)`, phase is randomized and
+  marginalized, and the decoder receives the same bare noise that drives the
+  canonical `SDDE-model` NoiseGrid simulation
+- the latent width remains configured directly as `self.ndims_latent` in
+  `ExpSetup`; if it is set above six for Jupiter, every additional coordinate
+  is retained as a free SABC statistic
 - default output directory: `sdde_ENCAFourierCNN_runs/`
 - logdir override: `ENCA_FOURIER_CNN_LOGDIR=/path/to/run`
 - GPU cluster launcher: `runtraining_gpu_encafouriercnn.sh`
@@ -100,9 +111,26 @@ The reference PyTorch project standardizes its Fourier data using mean and stand
 - input representation: Hann-windowed log normalized FFT amplitudes with shape `[batch, num_fft_components]`
 - encoder: `Dense(256, relu) -> Dense(256, relu) -> Dense(128, relu) -> Dense(ndims_latent)`
 - decoder: `Dense(128, relu) -> Dense(256, relu) -> Dense(256, relu) -> Dense(num_fft_components)`
+- simulator: canonical `sdde_model` StochasticDelayDiffEq solver with `EM()`,
+  also used by SABC
+- Jupiter contract: `z1` through `z6` regress `(tau, T, Nd, sigma, Bmax, Aj)`;
+  phase is freshly sampled per realization and is not a regressed parameter
+- latent width: set `NDIMS_LATENT=6` for only the six Jupiter regressors;
+  every additional coordinate is retained as a free statistic (`7` gives one,
+  `8` gives two, and so on)
+- noise contract: bare Gaussian increments are generated at `dt=0.1`, drive
+  the canonical solver, and are also supplied to the decoder at `saveat=1`;
+  the current MLP keeps an explicit, zero-weighted noise connection so this
+  interface can support noise-aware decoding later
 - default output directory: `sdde_MLP_runs/`
 - logdir override: `MLP_LOGDIR=/path/to/run`
 - cluster launchers: `runtraining_cpu_mlp.sh`, `runtraining_gpu_mlp.sh`
+
+Corrected Jupiter MLP training must use a fresh `MLP_LOGDIR`. The trainer
+refuses to resume checkpoints that predate the canonical explicit-noise solver
+metadata. Encoder-only diagnostics can still inspect a legacy checkpoint, but
+its decoder is incompatible with the corrected two-input decoder and must not
+be used for continued training or reconstruction.
 
 ### FNO
 
@@ -181,14 +209,18 @@ For ENCA, the observation dimensions are the time-domain trajectory samples. For
 
 Parameter regression loss:
 
-- use only the first 5 latent coordinates for parameter supervision
+- supervise the first five latent coordinates for the original model and the
+  first six for Jupiter; in the Jupiter model the sixth target is `Aj`
+- leave any coordinates after those regressors free (for example `z7` in a
+  seven-dimensional Jupiter run)
 - normalize each parameter error by its prior width
 - compute plain MSE on those normalized parameter errors
 
 In formula form:
 
 ```python
-loss_regress_params = mean(((params - params_pred[:, :5]) / prior_widths)^2)
+n_params = 6 if model == "jupiter" else 5
+loss_regress_params = mean(((params - params_pred[:, :n_params]) / prior_widths)^2)
 ```
 
 The final training objective is:
@@ -321,7 +353,8 @@ python recon_test_mlp.py \
   --T 3.0 \
   --Nd 8.0 \
   --sigma 0.12 \
-  --Bmax 10.0
+  --Bmax 10.0 \
+  --Aj 0.05  # required only for a Jupiter run
 ```
 
 For FNO runs:
@@ -383,6 +416,7 @@ CLI options:
 | `--Nd <float>` | yes | - | Fixed `Nd` value for the generated reconstruction sample. |
 | `--sigma <float>` | yes | - | Fixed `sigma` value for the generated reconstruction sample. |
 | `--Bmax <float>` | yes | - | Fixed `Bmax` value for the generated reconstruction sample. |
+| `--Aj <float>` | Jupiter only | - | Fixed Jupiter modulation amplitude. Rejected for original-model runs. |
 | `--seed <int>` | no | `1234` | First random seed used for sampled driving noise. With `--nseeds`, seeds are used consecutively from `seed` to `seed + nseeds - 1`. |
 | `--nseeds <int>` | no | `1` | Number of noise realizations to aggregate for the same fixed parameters. Must be at least `1`. |
 | `--outdir <path>` | no | `<run>/diagnostics` | Directory where the reconstruction comparison plot is written. |
@@ -420,14 +454,18 @@ Notes:
 
 ## MLP Prior Distribution In Latent Space
 
-[`prior_dist_latent_variables.py`](prior_dist_latent_variables.py) visualizes how simulated observations drawn from the parameter prior are distributed in the six-dimensional latent space of a trained Fourier-amplitude MLP. For every prior draw, the script:
+[`prior_dist_latent_variables.py`](prior_dist_latent_variables.py) visualizes how simulated observations drawn from the parameter prior are distributed in the latent space of a trained Fourier-amplitude MLP. It supports original runs with five regressors and Jupiter runs with six regressors, followed by any number of free statistics. For every prior draw, the script:
 
-1. samples `(tau, T, Nd, sigma, Bmax)` using the limits in the run's `hyper_parameters.json`;
+1. samples the model's physical parameters using the limits in the run's `hyper_parameters.json` (including `Aj` for Jupiter);
 2. simulates an SDDE observation;
 3. applies the same Hann-windowed log FFT-amplitude transformation used during training; and
-4. passes the transformed observation through the restored encoder to obtain `(z1, ..., z6)`.
+4. passes the transformed observation through the restored encoder without dropping any latent coordinate.
 
-The first five latent coordinates are the supervised parameter estimates. The sixth coordinate is the free, non-interpretable latent statistic. The generated overview therefore shows all ten three-dimensional combinations `(z_i, z_j, z6)` with `1 <= i < j <= 5`. In each PNG panel, a translucent blue prism marks the two displayed parameter priors and extends through the observed `z6` range. Points outside either displayed prior are colored red, and the axes expand to keep those outliers visible. Parameter `T` is sampled on the `dt` grid, as required by the SDDE simulator; the other parameters are sampled continuously and uniformly within their saved limits.
+For any Jupiter run, `z1` through `z6` are the supervised estimates
+`(tau, T, Nd, sigma, Bmax, Aj)` and `z7` onward are free statistics. The
+generated overview shows every `(z_i, z_j, z_last)` combination. Parameters,
+including the continuous delay `T`, are sampled uniformly from their saved
+priors and simulated by the same canonical solver used in SABC.
 
 The default model is `20260611_mlp_z6_1`, with 1000 prior samples and seed 1234:
 
@@ -490,7 +528,7 @@ With `--interactive`, the script additionally writes:
 prior_latent_model_best_ckpt_step550000_n1000_seed1234_z6_triplets_interactive.html
 ```
 
-Open this self-contained HTML file in a web browser to rotate, pan, and zoom each 3D panel. The interactive plots omit the prior prism for a cleaner view and render the prior cloud with low opacity, while outliers remain red. Hovering over a point shows all six latent coordinates and its five sampled physical parameters. The Plotly toolbar can also reset the camera or save the current view as an image.
+Open this self-contained HTML file in a web browser to rotate, pan, and zoom each 3D panel. The interactive plots omit the prior prism for a cleaner view and render the prior cloud with low opacity, while outliers remain red. Hovering over a point shows every latent coordinate and every sampled physical parameter. The Plotly toolbar can also reset the camera or save the current view as an image.
 
 When `--obs-sn-data` is supplied, the script follows the obsSN loader in SDDEpy and selects `data[49:-6]` from the full SILSO file. For `silso_SN_y_202601.csv`, this produces the 271 yearly values from 1749.5 through 2019.5 expected by the model. The encoded observation is shown above the translucent prior-sample cloud as a large magenta star in the PNG and as a magenta diamond labelled `obsSN` in the interactive HTML. Its numerical inputs and latent coordinates are also added to the NPZ as `observed_years`, `observed_values`, `observed_latent`, and `observed_data_path`.
 

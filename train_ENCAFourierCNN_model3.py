@@ -7,12 +7,11 @@
 # It maps each input time series to a spectrum, then to sufficient statistics;
 # the decoder combines those statistics with the original simulator noise.
 
-# IMPORTANT: init_julia() must happen before importing tensorflow,
-# otherwise there will be a conflict in the shared libraries used by both.
+# IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-from julia_bootstrap import init_julia
+from sdde_model import init_julia
 init_julia()
 
 import tensorflow as tf
@@ -286,26 +285,48 @@ class Manage_Hyper_Parameters:
 ##################################################################################################
 class ExpSetup:
     def __init__(self, window=""):
+        self.model = os.environ.get("MODEL", "original").strip().lower()
+        if self.model not in {"original", "jupiter"}:
+            raise ValueError(
+                f"Unknown SDDE model {self.model!r}; expected 'original' or 'jupiter'."
+            )
+
         tag = "fourier_cnn"
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_logdir = os.path.join(
             os.getcwd(),
             "sdde_ENCAFourierCNN_runs",
-            f"{run_id}_{tag}"
+            f"{run_id}_{self.model}_{tag}"
         )
         self.logdir = os.environ.get("ENCA_FOURIER_CNN_LOGDIR", default_logdir)
 
+        # Keep the latent width explicitly configured here. For Jupiter the
+        # first six coordinates are supervised; any additional hard-coded
+        # coordinates remain free SABC statistics.
         self.ndims_latent = 6
         self.num_noise_channels = 1
-        self.num_model_parameters = 5  # (tau, T, Nd, sigma, Bmax)
+        self.num_model_parameters = 6 if self.model == "jupiter" else 5
+        if self.ndims_latent < self.num_model_parameters:
+            raise ValueError(
+                f"ndims_latent={self.ndims_latent} cannot hold the "
+                f"{self.num_model_parameters} supervised parameters for "
+                f"model={self.model!r}."
+            )
         self.num_fft_components = 100
         self.window = validate_window(window)
+        self.representation_mode = "enca_fft_cnn"
+        self.simulation_backend = (
+            "sdde_model_sddeproblem_em_noisegrid"
+            if self.model == "jupiter"
+            else "legacy_enca_explicit_noise"
+        )
 
         # SDDE sim settings
         self.Twarmup = 200
         self.Tobs = 271 # C14 dataset: 929, obsSN dataset: 271
         self.dt = 0.1
         self.saveat = 1.0
+        self.jupiter_period = 11.86
 
         # derived length used by NN + dataset shapes
         ratio = self.Tobs / self.saveat
@@ -341,6 +362,7 @@ class ExpSetup:
         self.sigma_lims = (0.005, 0.05)
         # --------------------------------------------------------
         self.Bmax_lims = (1.0, 15.0)
+        self.Aj_lims = (0.0, 0.1)
 
 ##################################################################################################
 def parse_command_line_args():
@@ -370,7 +392,12 @@ def main():
 
     ##################################################################################################
     # Define a generator function for observations, parameters, and noise vectors
-    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+    generator_class = (
+        src.generators.DataGenerator_SolarDynamo_SDDE_Canonical
+        if args.model == "jupiter"
+        else src.generators.DataGenerator_SolarDynamo_SDDE_ENCA
+    )
+    gen_train = generator_class(
         Tobs=args.Tobs,
         saveat=args.saveat,
         num_noise_channels=args.num_noise_channels,
@@ -382,6 +409,9 @@ def main():
         Nd_lims=args.Nd_lims,
         sigma_lims=args.sigma_lims,
         Bmax_lims=args.Bmax_lims,
+        Aj_lims=args.Aj_lims,
+        model=args.model,
+        jupiter_period=args.jupiter_period,
     )
 
     def next_batch_from_generator(gen, batch_size):
@@ -397,8 +427,13 @@ def main():
 
         # Stack into numpy batches
         x_np = np.stack(xs, axis=0).astype(np.float32)      # (B, len, 1)
-        p_np = np.stack(ps, axis=0).astype(np.float32)      # (B, 5)
+        p_np = np.stack(ps, axis=0).astype(np.float32)
         n_np = np.stack(ns, axis=0).astype(np.float32)      # (B, len, nc)
+        if p_np.shape[1] != args.num_model_parameters:
+            raise ValueError(
+                f"Generator returned {p_np.shape[1]} parameters for "
+                f"model={args.model!r}; expected {args.num_model_parameters}."
+            )
 
         # Convert to TF tensors
         x_raw = tf.convert_to_tensor(x_np)
@@ -428,13 +463,24 @@ def main():
             sd = tf.math.squared_difference(y_true, y_pred)
             return tf.math.reduce_sum(sd / tf.math.maximum(tf.math.pow(y_true, 2), 1e-6), axis= -1)
 
-    param_widths = tf.constant([
+    param_width_values = [
         args.tau_lims[1] - args.tau_lims[0],
         args.T_lims[1] - args.T_lims[0],
         args.Nd_lims[1] - args.Nd_lims[0],
         args.sigma_lims[1] - args.sigma_lims[0],
         args.Bmax_lims[1] - args.Bmax_lims[0],
-    ], dtype=tf.float32)
+    ]
+    if args.model == "jupiter":
+        param_width_values.append(args.Aj_lims[1] - args.Aj_lims[0])
+    if len(param_width_values) != args.num_model_parameters:
+        raise ValueError(
+            f"Configured {len(param_width_values)} parameter widths, expected "
+            f"{args.num_model_parameters} for model={args.model!r}."
+        )
+    param_widths = tf.constant(param_width_values, dtype=tf.float32)
+    parameter_names = ["tau", "T", "Nd", "sigma", "Bmax"]
+    if args.model == "jupiter":
+        parameter_names.append("Aj")
 
     @tf.function
     def loss_reconstruction_fn_legacy(x, x_pred, return_each_dim=False):
@@ -537,11 +583,31 @@ def main():
 
     ##################################################################################################
     # Restore a previously interrupted training session (if exists)
-    ckpt.restore(save_manager.latest_checkpoint)
     if save_manager.latest_checkpoint:
-        print(f"Restored from {save_manager.latest_checkpoint}.")
-        # Double check if experiment setup matches the one in the saved chkpt dir
+        if args.model == "jupiter":
+            saved_model = (
+                getattr(hp_manager.args, "model", None)
+                if hp_manager.args is not None
+                else None
+            )
+            saved_backend = (
+                getattr(hp_manager.args, "simulation_backend", None)
+                if hp_manager.args is not None
+                else None
+            )
+            if (
+                saved_model != "jupiter"
+                or saved_backend != args.simulation_backend
+            ):
+                raise RuntimeError(
+                    "Refusing to resume this ENCAfftCNN checkpoint as a "
+                    "Jupiter run because it lacks the canonical explicit-noise "
+                    "Jupiter contract. Start in a new "
+                    "ENCA_FOURIER_CNN_LOGDIR."
+                )
         hp_manager.check_args_maybe_append(args)
+        ckpt.restore(save_manager.latest_checkpoint)
+        print(f"Restored from {save_manager.latest_checkpoint}.")
     else:
         print("Initializing training from scratch. \nLogdir: %s" % args.logdir)
         # Dump hyper-parameters to ckpt dir for future reference.
@@ -642,6 +708,8 @@ def main():
     print("x stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+    print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
+    print(f"simulation backend: {args.simulation_backend}")
     print(f"FFT window: {args.window or 'none (legacy)'}")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
@@ -849,6 +917,19 @@ class Sampler:
                 % hp_manager.param_config_fn
             )
         self.args.window = validate_window(getattr(hp_manager.args, 'window', ''))
+        self.args.model = getattr(hp_manager.args, 'model', 'original')
+        self.args.num_model_parameters = getattr(
+            hp_manager.args,
+            'num_model_parameters',
+            6 if self.args.model == 'jupiter' else 5,
+        )
+        self.args.simulation_backend = getattr(
+            hp_manager.args,
+            'simulation_backend',
+            'legacy_enca_explicit_noise',
+        )
+        self.args.Aj_lims = getattr(hp_manager.args, 'Aj_lims', [0.0, 0.1])
+        self.args.jupiter_period = float(getattr(hp_manager.args, 'jupiter_period', 11.86))
         self.check_hyper_params()
         self.prng = kwargs.get('prng', np.random.RandomState(1999))
         self.model_obj = None
@@ -955,7 +1036,12 @@ class Sampler:
         if prng is None:
             prng = self.prng
 
-        generator = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+        generator_class = (
+            src.generators.DataGenerator_SolarDynamo_SDDE_Canonical
+            if self.args.model == 'jupiter'
+            else src.generators.DataGenerator_SolarDynamo_SDDE_ENCA
+        )
+        generator = generator_class(
             prng=prng,
             Tobs=self.args.Tobs,
             saveat=self.args.saveat,
@@ -967,6 +1053,9 @@ class Sampler:
             Nd_lims=self.args.Nd_lims,
             sigma_lims=self.args.sigma_lims,
             Bmax_lims=self.args.Bmax_lims,
+            Aj_lims=self.args.Aj_lims,
+            model=self.args.model,
+            jupiter_period=self.args.jupiter_period,
         )
 
         iterator = generator.__iter__()

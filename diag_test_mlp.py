@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Diagonal test for Fourier-amplitude MLP: predicted params (encoder z[0:5])
-# vs true params. Saves a 5-panel scatter plot to disk.
+# Diagonal test for Fourier-amplitude MLP: supervised encoder coordinates
+# versus the corresponding true parameters.
 
 """
 How to run this test:
@@ -22,8 +22,8 @@ import argparse
 import datetime
 import json
 import numpy as np
-# IMPORTANT: init_julia() must happen before importing tensorflow
-from julia_bootstrap import init_julia
+# IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
+from sdde_model import init_julia
 init_julia()
 
 import matplotlib
@@ -37,7 +37,7 @@ import src.generators
 # ---------------------------
 # Helpers
 # ---------------------------
-PARAM_NAMES = ["tau", "T", "Nd", "sigma", "Bmax"]
+BASE_PARAM_NAMES = ["tau", "T", "Nd", "sigma", "Bmax"]
 
 
 def _as_tuple(x):
@@ -77,11 +77,13 @@ def find_latest_checkpoint(logdir: str, ckpt_prefix: str) -> str:
 def build_encoder_decoder(
     ndims_latent: int,
     num_fft_components: int,
+    len_timeseries: int,
+    num_noise_channels: int,
 ):
     """
     Rebuilds the same dense Fourier-amplitude MLP architecture as training.
-    Only encoder is used for diagonal test, but we include decoder in checkpoint
-    to match saved objects.
+    The diagonal test restores only the encoder. This also lets it inspect a
+    legacy encoder whose decoder predates the explicit-noise input contract.
     """
     x_input = tf.keras.layers.Input(shape=[num_fft_components], name="fft_amplitudes")
     x = tf.keras.layers.Dense(256, activation="relu", name="enc_dense_1")(x_input)
@@ -91,11 +93,22 @@ def build_encoder_decoder(
     encoder = tf.keras.Model(inputs=x_input, outputs=z)
 
     latent_mappings = tf.keras.layers.Input(shape=[ndims_latent], name="latent_representations")
-    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(latent_mappings)
+    noise_vectors = tf.keras.layers.Input(
+        shape=[len_timeseries, num_noise_channels], name="noise_vectors"
+    )
+    noise_zero = tf.keras.layers.Lambda(
+        lambda n: tf.zeros_like(tf.reduce_sum(n, axis=[1, 2])),
+        name="noise_interface_zero",
+    )(noise_vectors)
+    decoder_input = tf.keras.layers.Lambda(
+        lambda values: values[0] + values[1][:, tf.newaxis],
+        name="attach_noise_interface",
+    )([latent_mappings, noise_zero])
+    y = tf.keras.layers.Dense(128, activation="relu", name="dec_dense_1")(decoder_input)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_2")(y)
     y = tf.keras.layers.Dense(256, activation="relu", name="dec_dense_3")(y)
     y = tf.keras.layers.Dense(num_fft_components, activation=None, name="pred_fft_amplitudes")(y)
-    decoder = tf.keras.Model(inputs=latent_mappings, outputs=y)
+    decoder = tf.keras.Model(inputs=[latent_mappings, noise_vectors], outputs=y)
     return encoder, decoder
 
 
@@ -112,14 +125,14 @@ def timeseries_to_fft_log_amplitudes_np(
     return np.log(amplitudes[:, :num_fft_components] + fft_log_eps).astype(np.float32)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, prior_lims):
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, prior_lims, param_names):
     """
     Simple per-parameter diagnostics: RMSE, corr, normalized RMSE to prior width.
-    y_true/y_pred: shape (N, 5)
+    y_true/y_pred: shape (N, number of supervised parameters)
     """
     out = {}
     eps = 1e-12
-    for i, name in enumerate(PARAM_NAMES):
+    for i, name in enumerate(param_names):
         t = y_true[:, i]
         p = y_pred[:, i]
         rmse = float(np.sqrt(np.mean((p - t) ** 2)))
@@ -174,6 +187,21 @@ def main():
     saveat  = float(hp.get("saveat", 1.0))
 
     ndims_latent       = int(hp.get("ndims_latent", 20))
+    model = str(hp.get("model", "original")).strip().lower()
+    if model not in {"original", "jupiter"}:
+        raise ValueError(f"Unknown saved SDDE model {model!r}.")
+    param_names = BASE_PARAM_NAMES + (["Aj"] if model == "jupiter" else [])
+    num_model_parameters = int(hp.get("num_model_parameters", len(param_names)))
+    if num_model_parameters != len(param_names):
+        raise ValueError(
+            f"Saved model={model!r} requires {len(param_names)} regressors, but "
+            f"num_model_parameters={num_model_parameters}."
+        )
+    if ndims_latent < num_model_parameters:
+        raise ValueError(
+            f"ndims_latent={ndims_latent} is smaller than the "
+            f"{num_model_parameters} supervised parameters."
+        )
     num_noise_channels = int(hp.get("num_noise_channels", 1))
     representation_mode = hp.get("representation_mode")
     if representation_mode != "fourier_amplitude":
@@ -189,6 +217,8 @@ def main():
     Nd_lims    = _as_tuple(hp.get("Nd_lims",    (1.0, 15.0)))
     sigma_lims = _as_tuple(hp.get("sigma_lims", (0.01, 0.3)))
     Bmax_lims  = _as_tuple(hp.get("Bmax_lims",  (1.0, 15.0)))
+    Aj_lims    = _as_tuple(hp.get("Aj_lims",    (0.0, 0.1)))
+    jupiter_period = float(hp.get("jupiter_period", 11.86))
 
     len_timeseries = int(round(Tobs / saveat))
 
@@ -201,9 +231,11 @@ def main():
     encoder, decoder = build_encoder_decoder(
         ndims_latent=ndims_latent,
         num_fft_components=num_fft_components,
+        len_timeseries=len_timeseries,
+        num_noise_channels=num_noise_channels,
     )
 
-    ckpt = tf.train.Checkpoint(encoder=encoder, decoder=decoder)
+    ckpt = tf.train.Checkpoint(encoder=encoder)
 
     ckpt_path = find_latest_checkpoint(run_dir, ckpt_prefix=ckpt_prefix)
 
@@ -223,7 +255,7 @@ def main():
     # -------------------------
     # Build generator (must match training)
     # -------------------------
-    gen = src.generators.DataGenerator_SolarDynamo_SDDE_ENCA(
+    gen = src.generators.DataGenerator_SolarDynamo_SDDE_MLP(
         prng=prng,
         Tobs=Tobs,
         saveat=saveat,
@@ -235,13 +267,16 @@ def main():
         Nd_lims=Nd_lims,
         sigma_lims=sigma_lims,
         Bmax_lims=Bmax_lims,
+        Aj_lims=Aj_lims,
+        model=model,
+        jupiter_period=jupiter_period,
     )
     it = iter(gen)
 
     # Collect samples, then convert to the same Hann-windowed log FFT
     # amplitudes used by the MLP training loop.
     X_raw = np.zeros((args.nsamples, len_timeseries, 1), dtype=np.float32)
-    Ptrue = np.zeros((args.nsamples, 5), dtype=np.float32)
+    Ptrue = np.zeros((args.nsamples, num_model_parameters), dtype=np.float32)
 
     for i in range(args.nsamples):
         x0, p0, _ = next(it)
@@ -261,18 +296,21 @@ def main():
         Z[i0:i1] = encoder(X[i0:i1], training=False).numpy()
 
     # Core diagonal-test assumption:
-    Ppred = Z[:, :5]
+    Ppred = Z[:, :num_model_parameters]
 
     prior_lims = [tau_lims, T_lims, Nd_lims, sigma_lims, Bmax_lims]
-    metrics = compute_metrics(Ptrue, Ppred, prior_lims)
+    if model == "jupiter":
+        prior_lims.append(Aj_lims)
+    metrics = compute_metrics(Ptrue, Ppred, prior_lims, param_names)
 
     # Plot
-    fig = plt.figure(figsize=(18, 7.2), constrained_layout=True)
-    gs = fig.add_gridspec(2, 5, height_ratios=[4.8, 1.1])
-    axes = [fig.add_subplot(gs[0, j]) for j in range(5)]
-    text_axes = [fig.add_subplot(gs[1, j]) for j in range(5)]
+    n_params = len(param_names)
+    fig = plt.figure(figsize=(3.6 * n_params, 7.2), constrained_layout=True)
+    gs = fig.add_gridspec(2, n_params, height_ratios=[4.8, 1.1])
+    axes = [fig.add_subplot(gs[0, j]) for j in range(n_params)]
+    text_axes = [fig.add_subplot(gs[1, j]) for j in range(n_params)]
 
-    for j, name in enumerate(PARAM_NAMES):
+    for j, name in enumerate(param_names):
         ax = axes[j]
         text_ax = text_axes[j]
         t = Ptrue[:, j]
@@ -309,14 +347,15 @@ def main():
     out_png = os.path.join(outdir, f"diag_{ckpt_prefix}_step{step}_{stamp}.png")
     fig.suptitle(
         f"Diagonal test @ step {step} ({ckpt_prefix}) | nsamples={args.nsamples} | "
-        f"ndims_latent={ndims_latent} | MLP Fourier amplitudes"
+        f"model={model} | regressors={num_model_parameters} | "
+        f"ndims_latent={ndims_latent} | canonical SDDE/EM"
     )
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
 
     print(f"[OK] Restored: {ckpt_path}")
     print(f"[OK] Saved plot: {out_png}")
-    for k in PARAM_NAMES:
+    for k in param_names:
         print(
             f"  {k:5s}: rmse={metrics[k]['rmse']:.4g}  "
             f"corr={metrics[k]['corr']:.4f}  "
