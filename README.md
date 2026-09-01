@@ -119,9 +119,11 @@ The reference PyTorch project standardizes its Fourier data using mean and stand
   also used by SABC
 - Jupiter contract: `z1` through `z6` regress `(tau, T, Nd, sigma, Bmax, Aj)`;
   phase is freshly sampled per realization and is not a regressed parameter
-- latent width: set `NDIMS_LATENT=6` for only the six Jupiter regressors;
-  every additional coordinate is retained as a free statistic (`7` gives one,
-  `8` gives two, and so on)
+- latent width: configure `self.ndims_latent` directly in `ExpSetup`, as for
+  ENCAfftCNN; use `6` for only the six Jupiter regressors, while every
+  additional coordinate is retained as a free statistic (`7` gives one, `8`
+  gives two, and so on). Keep the launcher's naming-only `LATENT_TAG`
+  synchronized with that value
 - noise contract: bare Gaussian increments are generated at `dt=0.1`, drive
   the canonical solver, and are also supplied to the decoder at `saveat=1`;
   the current MLP keeps an explicit, zero-weighted noise connection so this

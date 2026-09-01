@@ -28,15 +28,11 @@
 module load cuda/11.6.2
 
 # SDDE variant used by DataGenerator_SolarDynamo_SDDE_ENCA.
-# Valid values are "original" and "jupiter".
-export MODEL="${MODEL:-jupiter}"
-if [[ "$MODEL" == "jupiter" ]]; then
-  default_latent_width=6
-else
-  default_latent_width=5
-fi
-# Set NDIMS_LATENT=7 for six Jupiter regressors plus one free statistic.
-export NDIMS_LATENT="${NDIMS_LATENT:-$default_latent_width}"
+# Valid values are "original" and "jupiter". The latent width remains
+# hard-coded in train_MLP_model3.py; keep LATENT_TAG synchronized with it for
+# the run-directory name only.
+export MODEL="jupiter"
+LATENT_TAG=6
 
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
 mkdir -p "$JULIA_DEPOT_PATH"
@@ -48,7 +44,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs
 # For the first launch, keep the automatic date stamp.
 # For a continuation run, replace this with the original run date, e.g. RUNSTAMP=20260413.
 RUNSTAMP=$(date +%Y%m%d)
-export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_${MODEL}_z${NDIMS_LATENT}_1
+export MLP_LOGDIR=/cfs/earth/scratch/ulzg/enca-inca/sdde_MLP_runs/${RUNSTAMP}_mlp_${MODEL}_z${LATENT_TAG}_1
 mkdir -p "$MLP_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
@@ -70,7 +66,7 @@ echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "MODEL=$MODEL"
-echo "NDIMS_LATENT=$NDIMS_LATENT"
+echo "LATENT_TAG=$LATENT_TAG (naming only; verify train_MLP_model3.py)"
 echo "MLP_LOGDIR=$MLP_LOGDIR"
 python -c "import sdde_model; print('Canonical SDDE model:', sdde_model.__file__)"
 nvidia-smi || true

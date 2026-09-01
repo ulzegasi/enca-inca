@@ -248,9 +248,11 @@ class ExpSetup:
         self.logdir = os.environ.get("MLP_LOGDIR", default_logdir)
 
         self.num_model_parameters = 6 if self.model == "jupiter" else 5
-        self.ndims_latent = int(
-            os.environ.get("NDIMS_LATENT", self.num_model_parameters)
-        )
+        # Keep the latent width configured in the training file, consistently
+        # with train_ENCAFourierCNN_model3.py.  Set this to 5 for an original
+        # model with regressors only, 6 for Jupiter with regressors only, or a
+        # larger value to retain additional free SABC statistics.
+        self.ndims_latent = 6
         if self.ndims_latent < self.num_model_parameters:
             raise ValueError(
                 f"ndims_latent={self.ndims_latent} cannot hold the "
