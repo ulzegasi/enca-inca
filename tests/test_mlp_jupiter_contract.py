@@ -107,6 +107,49 @@ class MlpJupiterGeneratorContractTest(unittest.TestCase):
         # as SABC; the MLP generator must not quantize it onto the dt grid.
         self.assertGreater(abs(float(targets[1]) / 0.1 - round(float(targets[1]) / 0.1)), 1e-5)
 
+    def test_threaded_batch_preserves_targets_noise_and_nuisance_phase(self):
+        captured = {}
+
+        def fake_batch(theta_batch, eps_batch, **kwargs):
+            captured["theta"] = np.asarray(theta_batch).copy()
+            captured["eps"] = np.asarray(eps_batch).copy()
+            captured["kwargs"] = kwargs
+            return np.tile(np.arange(4, dtype=np.float64), (2, 1))
+
+        generator = DataGenerator_SolarDynamo_SDDE_MLP(
+            prng=np.random.RandomState(31415),
+            model="jupiter",
+            Twarmup=2,
+            Tobs=4,
+            dt=0.1,
+            saveat=1.0,
+            tau_lims=(2.0, 2.0),
+            T_lims=(3.01, 3.09),
+            Nd_lims=(8.0, 8.0),
+            sigma_lims=(0.02, 0.02),
+            Bmax_lims=(10.0, 10.0),
+            Aj_lims=(0.04, 0.06),
+        )
+
+        with patch(
+            "sdde_model.solar_dynamo_jupiter.sn_from_noise_batch",
+            side_effect=fake_batch,
+        ):
+            observations, targets, noise = generator.sample_batch(2)
+
+        self.assertEqual(observations.shape, (2, 4, 1))
+        self.assertEqual(targets.shape, (2, 6))
+        self.assertEqual(noise.shape, (2, 4, 1))
+        self.assertEqual(captured["theta"].shape, (2, 7))
+        self.assertEqual(captured["eps"].shape, (2, 60))
+        np.testing.assert_allclose(captured["theta"][:, :6], targets)
+        np.testing.assert_array_equal(
+            noise[:, :, 0], captured["eps"][:, 20::10][:, :4]
+        )
+        self.assertTrue(np.all(captured["theta"][:, 6] >= 0.0))
+        self.assertTrue(np.all(captured["theta"][:, 6] < 2.0 * np.pi))
+        self.assertNotEqual(captured["theta"][0, 6], captured["theta"][1, 6])
+
     def test_canonical_period_cannot_drift(self):
         generator = DataGenerator_SolarDynamo_SDDE_MLP(
             model="jupiter",

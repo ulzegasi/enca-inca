@@ -34,6 +34,9 @@ export MODEL="jupiter"
 LATENT_TAG=6
 
 export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
+export JULIA_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+# Required by JuliaCall when Julia worker threads execute inside Python.
+export PYTHON_JULIACALL_HANDLE_SIGNALS=yes
 mkdir -p "$JULIA_DEPOT_PATH"
 
 mkdir -p "$TMPDIR"
@@ -61,6 +64,7 @@ echo "Working directory: $(pwd)"
 echo "Python used: $(command -v python)"
 python --version
 echo "Julia depot: $JULIA_DEPOT_PATH"
+echo "Julia threads: $JULIA_NUM_THREADS"
 echo "Julia used: $(command -v julia)"
 julia -v || true
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"

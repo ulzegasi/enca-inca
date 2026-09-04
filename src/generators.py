@@ -382,6 +382,87 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             theta += (float(self.prng.uniform(*self.Aj_lims)),)
         return theta
 
+    def sample_batch(self, batch_size):
+        """Generate one batch through the canonical threaded Julia API."""
+        try:
+            from sdde_model import sn_from_noise_batch as sn_from_noise_batch_original
+            from sdde_model.solar_dynamo_jupiter import (
+                JUPITER_ORBITAL_PERIOD_YEARS,
+                sn_from_noise_batch as sn_from_noise_batch_jupiter,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise ImportError(
+                "Threaded neural SDDE simulation requires an sdde-model checkout "
+                "that provides sn_from_noise_batch()."
+            ) from exc
+
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if self.model == "jupiter" and not np.isclose(
+            self.jupiter_period, JUPITER_ORBITAL_PERIOD_YEARS, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError(
+                "The canonical Jupiter integrator fixes the orbital period at "
+                f"{JUPITER_ORBITAL_PERIOD_YEARS} years, but jupiter_period="
+                f"{self.jupiter_period} was requested."
+            )
+
+        Tsim = self.Twarmup + self.Tobs
+        n_increments = int(round(Tsim / self.dt))
+        if abs(n_increments * self.dt - Tsim) > 1e-9:
+            raise ValueError(f"Tsim ({Tsim}) must be divisible by dt ({self.dt}).")
+
+        parameter_rows = []
+        simulator_rows = []
+        noise_rows = []
+        for _ in range(batch_size):
+            theta = self._sample_theta()
+            eps_dt = self.prng.normal(0.0, 1.0, size=n_increments).astype(np.float32)
+            parameter_rows.append(theta)
+            noise_rows.append(eps_dt)
+            if self.model == "jupiter":
+                phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
+                simulator_rows.append(theta + (phase,))
+            else:
+                simulator_rows.append(theta)
+
+        simulator_batch = np.asarray(simulator_rows, dtype=np.float64)
+        eps_batch = np.stack(noise_rows, axis=0)
+        simulate_batch = (
+            sn_from_noise_batch_jupiter
+            if self.model == "jupiter"
+            else sn_from_noise_batch_original
+        )
+        y_batch = simulate_batch(
+            simulator_batch,
+            eps_batch,
+            Twarmup=self.Twarmup,
+            Tobs=self.Tobs,
+            dt=self.dt,
+            saveat=self.saveat,
+        )
+        y_batch = np.asarray(y_batch, dtype=np.float32)
+        expected_shape = (batch_size, self.L)
+        if y_batch.shape != expected_shape:
+            raise ValueError(
+                f"Canonical SDDE batch simulator returned {y_batch.shape}, "
+                f"expected {expected_shape}."
+            )
+
+        params = np.asarray(parameter_rows, dtype=np.float32)
+        noise = eps_batch[
+            :, self.warmup_steps :: self.noise_stride
+        ][:, : self.L, np.newaxis]
+        if noise.shape[1] != self.L:
+            raise ValueError(
+                f"Downsampled canonical batch noise has length {noise.shape[1]}, "
+                f"expected {self.L}."
+            )
+        if self.num_noise_channels > 1:
+            noise = np.repeat(noise, self.num_noise_channels, axis=2)
+        return y_batch[..., np.newaxis], params, noise.astype(np.float32, copy=False)
+
     def __iter__(self):
         try:
             from sdde_model import sn_from_noise as sn_from_noise_original

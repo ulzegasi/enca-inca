@@ -395,20 +395,16 @@ def main():
     )
 
     def next_batch_from_generator(gen, batch_size):
-        """Collect batch_size samples from the Python generator (main thread)."""
-        xs = []
-        ps = []
-        ns = []
-        for _ in range(batch_size):
-            x0, p0, n0 = next(gen)   # gen yields numpy arrays
-            xs.append(x0)
-            ps.append(p0)
-            ns.append(n0)
-
-        # Stack into numpy batches
-        x_np = np.stack(xs, axis=0).astype(np.float32)      # (B, len, 1)
-        p_np = np.stack(ps, axis=0).astype(np.float32)
-        n_np = np.stack(ns, axis=0).astype(np.float32)      # (B, len, nc)
+        """Collect one batch, using the canonical threaded API when available."""
+        if hasattr(gen, "sample_batch"):
+            x_np, p_np, n_np = gen.sample_batch(batch_size)
+        else:
+            iterator = iter(gen)
+            samples = [next(iterator) for _ in range(batch_size)]
+            xs, ps, ns = zip(*samples)
+            x_np = np.stack(xs, axis=0).astype(np.float32)
+            p_np = np.stack(ps, axis=0).astype(np.float32)
+            n_np = np.stack(ns, axis=0).astype(np.float32)
         if p_np.shape[1] != args.num_model_parameters:
             raise ValueError(
                 f"Generator returned {p_np.shape[1]} parameters for "
@@ -662,11 +658,9 @@ def main():
     step = 0  # will survive after loop
     last_step_saved = False
 
-    gen_iter = iter(gen_train)
-
     print("Building first batch...")
     t0 = time.time()
-    x, params, noise = next_batch_from_generator(gen_iter, args.batch_size)
+    x, params, noise = next_batch_from_generator(gen_train, args.batch_size)
     print(f"First batch built in {time.time()-t0:.1f}s: x={x.shape}, params={params.shape}, noise={noise.shape}")
 
     # --- quick finiteness + stats checks (on first batch) ---
@@ -700,7 +694,7 @@ def main():
     # ---------------------------------------------------------
     while True:
         # 1) build batch (python)
-        x, params, noise = next_batch_from_generator(gen_iter, args.batch_size)
+        x, params, noise = next_batch_from_generator(gen_train, args.batch_size)
 
         # 2) train step (tf.function)
         loss_tuple, z_and_x, dict_mse = train_step(
