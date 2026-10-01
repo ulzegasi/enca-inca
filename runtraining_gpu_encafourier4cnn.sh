@@ -30,31 +30,16 @@ module load cuda/11.6.2
 # Training settings: edit these here, then submit with plain sbatch.
 export MODEL="jupiter"       # original or jupiter
 export INFER_PHASE="true"    # true requires jupiter; false marginalizes phase
-export NDIMS_LATENT=""       # empty = automatic (5/6/8); set a number for extra free coordinates
+export NDIMS_LATENT=8        # minimum: original=5, Jupiter=6, Jupiter with phase=8
 
-case "$INFER_PHASE" in
-  [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]) export INFER_PHASE=true ;;
-  [Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]) export INFER_PHASE=false ;;
-  *) echo "INFER_PHASE must be true or false." >&2; exit 2 ;;
-esac
-case "$MODEL" in
-  original) minimum_latent=5; model_label="" ;;
-  jupiter) minimum_latent=6; model_label="_jupiter" ;;
-  *) echo "MODEL must be original or jupiter." >&2; exit 2 ;;
-esac
+# Run-folder labels. The Python trainer validates the settings above.
+model_label=""
+if [[ "$MODEL" == "jupiter" ]]; then
+  model_label="_jupiter"
+fi
 phase_label=""
 if [[ "$INFER_PHASE" == "true" ]]; then
-  if [[ "$MODEL" != "jupiter" ]]; then
-    echo "INFER_PHASE=true requires MODEL=jupiter." >&2
-    exit 2
-  fi
-  minimum_latent=8
   phase_label="_phase"
-fi
-export NDIMS_LATENT="${NDIMS_LATENT:-$minimum_latent}"
-if [[ ! "$NDIMS_LATENT" =~ ^[0-9]+$ ]] || [[ "$NDIMS_LATENT" -lt "$minimum_latent" ]]; then
-  echo "NDIMS_LATENT must be an integer >= $minimum_latent." >&2
-  exit 2
 fi
 LATENT_TAG="$NDIMS_LATENT"
 

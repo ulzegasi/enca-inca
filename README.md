@@ -316,10 +316,13 @@ Set the options directly in either GPU launcher (these are its current settings)
 ```bash
 export MODEL="jupiter"
 export INFER_PHASE="true"
-export NDIMS_LATENT=""  # automatic: 8 for Jupiter phase inference
+export NDIMS_LATENT=8
 ```
 
-Then submit normally, with no command-line configuration:
+Set the latent width explicitly: at least 5 for the original model, 6 for
+Jupiter without phase inference, or 8 for Jupiter with phase inference. The
+Python trainer validates these settings; the launcher only constructs the run
+folder name. Then submit normally, with no command-line configuration:
 
 ```bash
 sbatch runtraining_gpu_encafourier2cnn.sh

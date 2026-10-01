@@ -235,13 +235,12 @@ class PhaseTrainingTest(unittest.TestCase):
                 # Exercise settings as edited in the script, not shell overrides.
                 edited = probe.replace('export MODEL="jupiter"', f'export MODEL="{model}"', 1)
                 edited = edited.replace('export INFER_PHASE="true"', f'export INFER_PHASE="{flag}"', 1)
+                edited = edited.replace('export NDIMS_LATENT=8', f'export NDIMS_LATENT={width}', 1)
                 env = dict(PATH=os.environ["PATH"], MODEL="original", INFER_PHASE="false", NDIMS_LATENT="5")
                 result = subprocess.run(["bash", "-c", edited], env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.startswith(f"{width} "))
                 self.assertIn(tag, result.stdout)
-            invalid = subprocess.run(["bash", "-c", probe.replace('export MODEL="jupiter"', 'export MODEL="original"', 1)], capture_output=True)
-            self.assertNotEqual(invalid.returncode, 0)
 
 
 if __name__ == "__main__":
