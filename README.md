@@ -110,22 +110,77 @@ The reference PyTorch project standardizes its Fourier data using mean and stand
 
 ### ENCAfft2CNN
 
-`train_ENCAfft2CNN_model3.py` is a separate variant of the Fourier-CNN training
-script. Its decoder replaces noise interpolation with the real and imaginary
-parts of `rFFT(noise) / sqrt(len_timeseries)`, concatenated as channels with the
-latent projection. The FFT runs along time independently for each noise channel.
-Noise is neither windowed nor converted to magnitudes; the observation target
-still uses `log1p(abs(rFFT(Hann(x))))`.
+`train_ENCAfft2CNN_model3.py` implements a separate ENCA variant that conditions
+the decoder on the **complex Fourier coefficients of the supplied driving
+noise**. Like ENCAfftCNN (`train_ENCAFourierCNN_model3.py`), it encodes an observed
+log-amplitude spectrum into latent summary statistics, then reconstructs that
+spectrum from the summaries and the matching noise realization. The difference
+is how the noise is represented at the decoder's convolutional layers.
+
+| Component | ENCAfftCNN | ENCAfft2CNN |
+| --- | --- | --- |
+| Encoder input and reconstruction target | `log1p(abs(rFFT(Hann(x))))` | Same |
+| Encoder | Convolutions, pooling, and global average pooling | Same architecture |
+| Noise processing | Bilinear interpolation of time samples to the target spectrum length | rFFT along time, divided by `sqrt(N)`, retaining the target frequency bins |
+| Noise channels entering decoder convolutions | One per supplied noise channel | Two per supplied noise channel: real and imaginary parts |
+| Decoder input after concatenation, for one noise channel | `[batch, K, 2]`: latent projection + resized noise | `[batch, K, 3]`: latent projection + real noise FFT + imaginary noise FFT |
+| Decoder convolution stack | `Conv1D(32) -> Conv1D(32) -> Conv1D(16) -> Conv1D(1)` | Same stack, with the wider input |
+| Training objective | Spectral reconstruction loss plus supervised parameter regression loss | Same |
+
+Here `N = len_timeseries` (271 by default) and `K = num_fft_components`
+(100 by default). Resizing in ENCAfftCNN makes the dimensions compatible, but
+does not transform time samples into frequency coefficients. Consequently,
+those resized samples have no direct frequency correspondence to the output
+bins. ENCAfft2CNN supplies noise features on the same frequency grid as the
+target, giving the decoder a more natural representation for learning spectral
+reconstruction.
+
+For each supplied noise channel `epsilon`, the new conditioning is:
+
+```text
+E = rFFT(epsilon) / sqrt(N)
+decoder features at bin k = [projected latent(k), Re(E[k]), Im(E[k])]
+```
+
+Both real and imaginary parts are retained because they encode amplitude and
+phase. Noise magnitude alone would discard phase, which can affect output
+amplitudes in nonlinear dynamics. The decoder still has to learn interactions
+between frequencies; this representation does not assume that each output bin
+depends only on the corresponding noise bin. Better reconstruction or parameter
+recovery is a hypothesis to test, not an established result.
+
+The `1/sqrt(N)` factor is a fixed, reversible normalization applied equally to
+real and imaginary parts. It keeps the typical coefficient scale comparable
+across sequence lengths. At a fixed sequence length an unnormalized FFT is also
+valid: learned weights can absorb the constant scale, although initialization
+and optimization can differ. This is not per-realization standardization, and
+it does not subtract the mean or remove phase information.
+
+Noise is **unwindowed** (`noise_window=""`), while the observation target keeps
+its symmetric Hann window. Hann tapering smooths observation boundaries for the
+spectral target; applying it to the noise would also suppress conditioning
+information near the boundaries. In a system with memory, early noise can
+influence later observations. The conditioning input and target therefore need
+not use the same window. No logarithm or magnitude operation is applied to the
+noise coefficients.
 
 The first `num_fft_components` bins are retained for both noise and target
 (100 by default). Higher noise frequencies are therefore omitted; set
-`num_fft_components = len_timeseries // 2 + 1` to retain the full rFFT. The
-noise supplied by the existing generator is the observation-grid noise after
-warmup, not the full fine-step simulator noise history.
+`num_fft_components = len_timeseries // 2 + 1` to retain the full rFFT for both
+noise and target. Only the full set of complex coefficients is an invertible
+representation of the supplied noise. The noise supplied by the existing
+generator is the observation-grid noise after warmup, not the full fine-step
+simulator noise history.
 
 The decoder and `Sampler.decode` accept raw noise and compute this FFT internally,
-so training and inference use identical conditioning. Original and Jupiter
-models, the encoder, losses, and training settings follow the original script.
+so training and inference use identical conditioning. Encoding observations into
+summary statistics requires only the observations; noise is needed for decoding.
+The simulator, losses, and training procedure follow the original script.
+The current experiment uses `MODEL=original` and five latent coordinates,
+supervising `(tau, T, Nd, sigma, Bmax)` with no additional free coordinate.
+For a controlled comparison with ENCAfftCNN, match the latent width, simulator
+settings, priors, spectral target, and training budget between runs.
+
 Runs use `sdde_ENCAFourier2CNN_runs/`, with override `ENCA_FOURIER2_CNN_LOGDIR`.
 Checkpoint metadata records `representation_mode="enca_fft2_cnn"` and
 `noise_fft_representation="rfft_real_imag_ortho"`; old ENCAfftCNN checkpoints
