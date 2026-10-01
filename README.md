@@ -108,6 +108,42 @@ reader remains available only so older checkpoints can still be inspected.
 
 The reference PyTorch project standardizes its Fourier data using mean and standard deviation computed from a finite training set. This online variant does not use dataset-wide standardization; `log1p` compresses the spectral dynamic range and the balanced reconstruction loss normalizes each sample's error by its RMS spectral amplitude.
 
+### ENCAfft2CNN
+
+`train_ENCAfft2CNN_model3.py` is a separate variant of the Fourier-CNN training
+script. Its decoder replaces noise interpolation with the real and imaginary
+parts of `rFFT(noise) / sqrt(len_timeseries)`, concatenated as channels with the
+latent projection. The FFT runs along time independently for each noise channel.
+Noise is neither windowed nor converted to magnitudes; the observation target
+still uses `log1p(abs(rFFT(Hann(x))))`.
+
+The first `num_fft_components` bins are retained for both noise and target
+(100 by default). Higher noise frequencies are therefore omitted; set
+`num_fft_components = len_timeseries // 2 + 1` to retain the full rFFT. The
+noise supplied by the existing generator is the observation-grid noise after
+warmup, not the full fine-step simulator noise history.
+
+The decoder and `Sampler.decode` accept raw noise and compute this FFT internally,
+so training and inference use identical conditioning. Original and Jupiter
+models, the encoder, losses, and training settings follow the original script.
+Runs use `sdde_ENCAFourier2CNN_runs/`, with override `ENCA_FOURIER2_CNN_LOGDIR`.
+Checkpoint metadata records `representation_mode="enca_fft2_cnn"` and
+`noise_fft_representation="rfft_real_imag_ortho"`; old ENCAfftCNN checkpoints
+cannot be resumed. Use this script's `Sampler` for inference; the existing
+ENCAfftCNN diagnostic scripts do not load this new variant.
+
+```bash
+MODEL=original ENCA_FOURIER2_CNN_LOGDIR=sdde_ENCAFourier2CNN_runs/my_run \
+  python train_ENCAfft2CNN_model3.py
+```
+
+On the GPU cluster, submit `sbatch runtraining_gpu_encafourier2cnn.sh`.
+This dedicated launcher uses the new script and run directory, with the same
+cluster settings as the original launcher. Defaults are `MODEL=original` and
+five supervised latent dimensions. Jupiter requires at least six latent
+dimensions; keep `LATENT_TAG` and the job name synchronized with
+`ExpSetup.ndims_latent` when changing it.
+
 ### MLP
 
 [train_MLP_model3.py](/Users/ulzg/switchdrive/ZHAW_BISTOM/RENKU/enca-inca/train_MLP_model3.py) is the Fourier-amplitude MLP autoencoder. It keeps `representation_mode = "fourier_amplitude"` in `ExpSetup` for checkpoint metadata compatibility.
