@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import tensorflow as tf
+from src import enca_phase
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ def load_definitions(filename, names, namespace, parent=None):
 
 SCRIPT = "train_ENCAfft4CNN_model3.py"
 NS = {"tf": tf, "np": np, "VALID_WINDOWS": ("", "Hann"),
-      "os": os, "datetime": datetime}
+      "os": os, "datetime": datetime, "enca_phase": enca_phase}
 load_definitions(SCRIPT, {
     "Architecture", "Sampler", "ExpSetup", "validate_window",
     "timeseries_to_fourier_real_imag", "timeseries_to_fourier_log_amplitude",

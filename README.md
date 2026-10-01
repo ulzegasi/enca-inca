@@ -196,10 +196,12 @@ MODEL=original ENCA_FOURIER2_CNN_LOGDIR=sdde_ENCAFourier2CNN_runs/my_run \
 
 On the GPU cluster, submit `sbatch runtraining_gpu_encafourier2cnn.sh`.
 This dedicated launcher uses the new script and run directory, with the same
-cluster settings as the original launcher. Defaults are `MODEL=original` and
-five supervised latent dimensions. Jupiter requires at least six latent
-dimensions; keep `LATENT_TAG` and the job name synchronized with
-`ExpSetup.ndims_latent` when changing it.
+cluster settings as the original launcher. Edit `MODEL`, `INFER_PHASE`, and
+`NDIMS_LATENT` directly in the launcher's training-settings block; its run label
+follows the selected width automatically. The launcher is currently configured
+for Jupiter with phase inference and eight supervised coordinates. Direct Python
+execution without environment settings still defaults to the original model
+with five supervised coordinates.
 
 ### ENCAfft4CNN
 
@@ -225,7 +227,8 @@ noise remains unwindowed. The encoder coefficients retain their signs and have
 no logarithmic compression or per-realization standardization. Consequently,
 this experiment changes the encoder's numerical representation as well as
 adding phase information; it is not a comparison with identical feature scales.
-Phase can also encode timing variation that the summaries must learn to ignore.
+When phase is marginalized, it can encode timing variation that the summaries
+must learn to ignore; when inferring phase, that timing can be relevant signal.
 Any benefit to parameter recovery must be measured.
 
 The decoder architecture, noise preprocessing, reconstruction target, and losses
@@ -235,7 +238,9 @@ the 200 complex encoder features: the batch loader provides a separate
 `Sampler.sample`, and `Sampler.reconstruct` all use the complex encoder
 preprocessing. The first `K` bins are retained for both observations and noise.
 
-Defaults are `MODEL=original` and five supervised latent variables. Runs are
+Direct Python defaults are `MODEL=original` and five supervised latent variables;
+the cluster launcher is currently configured for Jupiter phase inference with
+eight supervised coordinates. Runs are
 stored under `sdde_ENCAFourier4CNN_runs/`; use `ENCA_FOURIER4_CNN_LOGDIR` to
 override the run directory. Checkpoint metadata distinguishes the encoder,
 noise, and reconstruction representations with `representation_mode="enca_fft4_cnn"`,
@@ -252,6 +257,91 @@ MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/my_run \
 # On the GPU cluster:
 sbatch runtraining_gpu_encafourier4cnn.sh
 ```
+
+### Optional Jupiter phase supervision (ENCAfft2CNN and ENCAfft4CNN)
+
+Set `MODEL=jupiter INFER_PHASE=true` to train summaries for all seven physical
+parameters `(tau, T, Nd, sigma, Bmax, Aj, phi)`. The default phase prior is
+**uniform on `[0, 2*pi)` in radians**. The scalar and threaded batch generators
+return the exact phase passed to the simulator, alongside the same driving
+noise. Phi is defined in `cos(2*pi*t/11.86 + phi)` at **simulator t=0, before
+warmup**; this reference must also be used by any later inference code.
+
+The encoder has **eight supervised coordinates**, in this order:
+
+```text
+[tau, T, Nd, sigma, Bmax, Aj, sin(phi), cos(phi)]
+```
+
+The generator returns seven physical values; only the trainer converts phi to
+the two circular targets. This avoids an artificial discontinuity between zero
+and `2*pi`. Eight summary coordinates still represent seven physical unknowns.
+The decoder projects the latent vector to 100 positions as before; its CNN
+still receives `[batch, 100, 3]` and reconstructs 100 log-amplitudes.
+
+| Configuration | Physical parameters | Supervised coordinates / default latent width |
+| --- | --- | --- |
+| `MODEL=original INFER_PHASE=false` | 5 | 5 |
+| `MODEL=jupiter INFER_PHASE=false` | 6 (phi marginalized) | 6 |
+| `MODEL=jupiter INFER_PHASE=true` | 7 (phi inferred) | 8 |
+
+For direct Python execution, `INFER_PHASE` defaults to `false`. Enabling it with
+`MODEL=original` is rejected.
+`NDIMS_LATENT` can add free coordinates, but cannot be smaller than the supervised
+width. Existing MLP and other generator callers retain their prior behavior:
+phase supervision must be requested explicitly by the trainer.
+
+For the default balanced loss, the first six regression terms remain squared
+errors divided by their squared prior widths. For phase, sine and cosine each
+have range 2, so their contribution is:
+
+```text
+L_phi = mean_over_batch(((z7 - sin(phi))/2)^2 + ((z8 - cos(phi))/2)^2) / 2
+L_reg = (L_tau + L_T + L_Nd + L_sigma + L_Bmax + L_Aj + L_phi) / 7
+L_total = lambda_recon * L_recon + lambda_reg * L_reg
+```
+
+Thus phase counts as one parameter contribution, despite using two coordinates.
+The legacy loss retains its relative-error terms for the six scalar parameters,
+but also uses this stable MSE for phase, never division by sine or cosine.
+Predicted phase is `atan2(z7, z8) mod (2*pi)`; outputs are not forced to unit
+length. TensorBoard logs sine/cosine RMSE, the phase loss, wrapped angular RMSE
+in radians, and mean predicted phase-vector norm. An angle from a near-zero
+vector is not a reliable phase estimate. At zero Jupiter amplitude, phase is
+unidentifiable. ENCAfft4CNN retains direct observation phase information and is
+the preferred first test; ENCAfft2CNN may have much weaker phase sensitivity.
+
+Set the options directly in either GPU launcher (these are its current settings):
+
+```bash
+export MODEL="jupiter"
+export INFER_PHASE="true"
+export NDIMS_LATENT=""  # automatic: 8 for Jupiter phase inference
+```
+
+Then submit normally, with no command-line configuration:
+
+```bash
+sbatch runtraining_gpu_encafourier2cnn.sh
+sbatch runtraining_gpu_encafourier4cnn.sh
+```
+
+Alternatively, run Python with those environment settings directly. Phase runs
+use distinct `_jupiter_phase_z8` launcher folder names under the existing
+`sdde_ENCAFourier2CNN_runs/` or `sdde_ENCAFourier4CNN_runs/` roots. The respective
+`ENCA_FOURIER2_CNN_LOGDIR` / `ENCA_FOURIER4_CNN_LOGDIR` override is honored when
+resuming. Use a different directory for each concurrently running experiment.
+
+Checkpoint metadata saves `infer_phase`, the seven physical parameter names,
+eight supervised target names, `phase_encoding="sin_cos"`, phase prior, time
+reference, and loss convention. Resuming cannot switch phase mode. Older
+checkpoints without phase metadata are treated as phase-marginalized and can
+still be resumed with matching settings. `Sampler(logdir=...)` reads the saved
+configuration, independent of the current shell's model or phase settings.
+
+This option implements **training only**. SABC's parameter vector, simulator
+wrapper, and summary loader still need a separate update before seven-parameter
+inference is supported.
 
 ### MLP
 

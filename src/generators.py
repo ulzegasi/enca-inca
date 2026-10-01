@@ -362,10 +362,23 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
     For the Jupiter model, ``params`` contains the six inference parameters
     ``(tau, T, Nd, sigma, Bmax, Aj)``.  A fresh phase is sampled for every
     realization and passed to the seven-input simulator, but is intentionally
-    omitted from ``params``.
+    omitted from ``params`` by default. With ``infer_phase=True``, ``params``
+    contains all seven physical parameters, including that exact phase in
+    radians. Its reference is simulator t=0, before warmup. Training converts
+    the final scalar to sine/cosine targets; the simulator still takes phi.
     """
 
     simulation_backend = "sdde_model_sddeproblem_em_noisegrid_v2"
+
+    def __init__(self, *args, infer_phase=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not isinstance(infer_phase, bool):
+            raise ValueError("infer_phase must be a boolean.")
+        if infer_phase and self.model != "jupiter":
+            raise ValueError("infer_phase=True requires model='jupiter'.")
+        # Never read INFER_PHASE implicitly: existing MLP/ENCA callers retain
+        # their six-parameter contract even in a phase-enabled shell.
+        self.infer_phase = infer_phase
 
     def _sample_theta(self):
         # The canonical delay solver supports a continuous delay.  Sampling T
@@ -419,13 +432,14 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
         for _ in range(batch_size):
             theta = self._sample_theta()
             eps_dt = self.prng.normal(0.0, 1.0, size=n_increments).astype(np.float32)
-            parameter_rows.append(theta)
             noise_rows.append(eps_dt)
             if self.model == "jupiter":
                 phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
                 simulator_rows.append(theta + (phase,))
+                parameter_rows.append(theta + (phase,) if self.infer_phase else theta)
             else:
                 simulator_rows.append(theta)
+                parameter_rows.append(theta)
 
         simulator_batch = np.asarray(simulator_rows, dtype=np.float64)
         eps_batch = np.stack(noise_rows, axis=0)
@@ -500,7 +514,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             if self.model == "jupiter":
                 phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
                 # sdde_model's canonical simulator API accepts the six inferred
-                # parameters plus the nuisance phase as its seventh input.
+                # parameters plus the phase as its seventh input.
                 theta_simulator = theta + (phase,)
                 y = sn_from_noise_jupiter(
                     theta_simulator,
@@ -528,7 +542,9 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
                 )
 
             x = y.reshape(self.L, 1)
-            params = np.asarray(theta, dtype=np.float32)
+            params = np.asarray(
+                theta_simulator if self.infer_phase else theta, dtype=np.float32
+            )
 
             eps_obs = eps_dt[self.warmup_steps:]
             noise_1d = eps_obs[::self.noise_stride][:self.L]

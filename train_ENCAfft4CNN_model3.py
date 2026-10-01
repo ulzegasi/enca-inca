@@ -50,6 +50,7 @@ if _DEBUG:
 # custom libs
 import src.generators
 import src.utils_tf
+from src import enca_phase
 
 ##################################################################################################
 VALID_WINDOWS = ("", "Hann")
@@ -222,6 +223,7 @@ class Manage_Hyper_Parameters:
         """
         if self.args is None:
             return None
+        enca_phase.validate_phase_checkpoint(self.args, args)
 
         def _norm(v):
             # JSON loads tuples as lists; treat them equivalently.
@@ -341,7 +343,9 @@ class ExpSetup:
                 f"Unknown SDDE model {self.model!r}; expected 'original' or 'jupiter'."
             )
 
-        tag = "fft4_cnn"
+        infer_phase = enca_phase.parse_infer_phase(os.environ.get("INFER_PHASE", "false"))
+        self.__dict__.update(enca_phase.phase_configuration(self.model, infer_phase))
+        tag = "fft4_cnn" + ("_phase" if self.infer_phase else "")
         run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_logdir = os.path.join(
             os.getcwd(),
@@ -350,16 +354,15 @@ class ExpSetup:
         )
         self.logdir = os.environ.get("ENCA_FOURIER4_CNN_LOGDIR", default_logdir)
 
-        # Five supervised coordinates for the original model. Jupiter needs
-        # at least six; coordinates beyond the supervised parameters are free.
-        self.ndims_latent = 5
+        # Defaults: original=5, Jupiter=6, Jupiter with phase=8 (sin, cos).
+        # NDIMS_LATENT may add free summary coordinates beyond these targets.
+        self.ndims_latent = int(os.environ.get("NDIMS_LATENT", self.num_supervised_parameters))
         self.num_noise_channels = 1
-        self.num_model_parameters = 6 if self.model == "jupiter" else 5
-        if self.ndims_latent < self.num_model_parameters:
+        if self.ndims_latent < self.num_supervised_parameters:
             raise ValueError(
                 f"ndims_latent={self.ndims_latent} cannot hold the "
-                f"{self.num_model_parameters} supervised parameters for "
-                f"model={self.model!r}."
+                f"{self.num_supervised_parameters} supervised coordinates for "
+                f"model={self.model!r}, infer_phase={self.infer_phase}."
             )
         self.num_fft_components = 100
         # Fourier-CNN ENCA always uses the symmetric Hann preprocessing.
@@ -445,6 +448,7 @@ def main():
         Bmax_lims=args.Bmax_lims,
         Aj_lims=args.Aj_lims,
         model=args.model,
+        infer_phase=args.infer_phase,
         jupiter_period=args.jupiter_period,
     )
 
@@ -506,15 +510,13 @@ def main():
     ]
     if args.model == "jupiter":
         param_width_values.append(args.Aj_lims[1] - args.Aj_lims[0])
-    if len(param_width_values) != args.num_model_parameters:
+    if len(param_width_values) != args.num_linear_parameters:
         raise ValueError(
             f"Configured {len(param_width_values)} parameter widths, expected "
-            f"{args.num_model_parameters} for model={args.model!r}."
+            f"{args.num_linear_parameters} non-circular parameters for model={args.model!r}."
         )
     param_widths = tf.constant(param_width_values, dtype=tf.float32)
-    parameter_names = ["tau", "T", "Nd", "sigma", "Bmax"]
-    if args.model == "jupiter":
-        parameter_names.append("Aj")
+    parameter_names = args.parameter_names
 
     @tf.function
     def loss_reconstruction_fn_legacy(x, x_pred, return_each_dim=False):
@@ -530,21 +532,19 @@ def main():
 
     @tf.function
     def loss_regress_params_fn_legacy(params, params_pred, return_each_dim=False):
-        ''' Notice params_pred can have more dimensions than params (free dimensions).
-        If not using this loss, return 0. instead.'''
-        num_params = params._shape_as_list()[-1]
-        if return_each_dim:
-            d = {}
-            for i in range(num_params):
-                # d['MSE_z_%d'%(i+1)] = tf.keras.losses.MeanSquaredError(name='loss_param_%d'%(i+1))(params[...,i], params_pred[...,i])
-                d['ChiSquare_z_%d'%(i+1)] = ChiSquareStatistic(name='ChiSquare_z_%d'%(i+1))(params[...,i], params_pred[...,i]) / num_params
-            return d
-        else:
-            loss = 0.
-            for i in range(num_params):
-                # loss += tf.keras.losses.MeanSquaredError(name='loss_param_%d'%(i+1))(params[...,i], params_pred[...,i])
-                loss += ChiSquareStatistic(name='ChiSquare_z_%d'%(i+1))(params[...,i], params_pred[...,i]) / num_params
-            return loss
+        # Retain legacy relative errors for scalar parameters, but always use
+        # a bounded-scale MSE for sin/cos (relative errors fail near zero).
+        infer_phase = getattr(args, "infer_phase", False)
+        num_physical = params.shape[-1]
+        num_linear = num_physical - int(infer_phase)
+        d = {}
+        for i in range(num_linear):
+            d[f'ChiSquare_z_{i+1}'] = ChiSquareStatistic(name=f'ChiSquare_z_{i+1}')(
+                params[..., i], params_pred[..., i]
+            ) / num_physical
+        if infer_phase:
+            d['NormMSE_phi'] = enca_phase.phase_pair_mse(params, params_pred) / num_physical
+        return d if return_each_dim else tf.reduce_sum(list(d.values()))
 
     @tf.function
     def loss_reconstruction_fn_balanced(x, x_pred, return_each_dim=False):
@@ -569,22 +569,15 @@ def main():
 
     @tf.function
     def loss_regress_params_fn_balanced(params, params_pred, return_each_dim=False):
-        """
-        Mean squared error after normalizing each parameter by its prior width.
-        Only the first num_model_parameters latent dimensions are supervised.
-        """
-        num_params = params._shape_as_list()[-1]
-        params_pred_used = params_pred[..., :num_params]
-        widths = tf.cast(param_widths[:num_params], params.dtype)
-        sq_error = tf.square((params - params_pred_used) / widths)
-
-        if return_each_dim:
-            d = {}
-            for i in range(num_params):
-                d[f'NormMSE_z_{i+1}'] = tf.reduce_mean(sq_error[:, i])
-            return d
-
-        return tf.reduce_mean(sq_error)
+        """Prior-range MSE; sin/cos together count as one physical parameter."""
+        infer_phase = getattr(args, "infer_phase", False)
+        num_linear = params.shape[-1] - int(infer_phase)
+        widths = tf.cast(param_widths[:num_linear], params.dtype)
+        sq_error = tf.square((params[..., :num_linear] - params_pred[..., :num_linear]) / widths)
+        d = {f'NormMSE_z_{i+1}': tf.reduce_mean(sq_error[:, i]) for i in range(num_linear)}
+        if infer_phase:
+            d['NormMSE_phi'] = enca_phase.phase_pair_mse(params, params_pred)
+        return d if return_each_dim else tf.reduce_mean(tf.stack(list(d.values())))
     # Define additional metrics for logging at every
 
     ##################################################################################################
@@ -706,6 +699,8 @@ def main():
     dict_avg_loss_reg_p_items = {}
     dict_avg_rmse_recon_items = {}
     dict_avg_rmse_reg_p_items = {}
+    avg_phase_mse = tf.keras.metrics.Mean(name='phase_wrapped_mse')
+    avg_phase_norm = tf.keras.metrics.Mean(name='phase_vector_norm')
 
     ##################################################################################################
     # Define a metric to keep track of best reconstruction over a longer window
@@ -740,6 +735,7 @@ def main():
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
     print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
+    print(f"infer_phase={args.infer_phase}; supervised targets: {', '.join(args.supervised_names)}")
     print(f"simulation backend: {args.simulation_backend}")
     print(f"FFT window: {args.window or 'none (legacy)'}")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
@@ -805,16 +801,21 @@ def main():
                 y_true=x[..., i_], y_pred=x_reconst[..., i_]
             )
 
-        # RMSE regression
-        for i_ in range(params.shape[-1]):
+        # RMSE of supervised coordinates (physical phi is never compared to sin(phi)).
+        regression_targets = enca_phase.supervised_targets(params, args.infer_phase)
+        for i_ in range(regression_targets.shape[-1]):
             k = f'RMSE_z_ch_{i_+1}'
             if k not in dict_avg_rmse_reg_p_items:
                 dict_avg_rmse_reg_p_items[k] = tf.keras.metrics.RootMeanSquaredError(
                     name='rmse_regularization', dtype=tf.float32
                 )
             dict_avg_rmse_reg_p_items[k].update_state(
-                y_true=params[..., i_], y_pred=z_latent[..., i_]
+                y_true=regression_targets[..., i_], y_pred=z_latent[..., i_]
             )
+
+        if args.infer_phase:
+            avg_phase_mse.update_state(tf.square(enca_phase.wrapped_phase_error(params, z_latent)))
+            avg_phase_norm.update_state(tf.norm(z_latent[..., 6:8], axis=-1))
 
         # ------------------------------------------------
         # Logging block
@@ -829,9 +830,15 @@ def main():
                 'loss_weight/lambda_reg': tf.constant(args.lambda_reg, dtype=tf.float32),
             }
 
+            if args.infer_phase:
+                d_scalars['phase/circular_rmse_rad'] = tf.sqrt(avg_phase_mse.result())
+                d_scalars['phase/mean_predicted_vector_norm'] = avg_phase_norm.result()
+                avg_phase_mse.reset_state()
+                avg_phase_norm.reset_state()
+
             # --- Parameter ranges in current batch ---
             # (safe even with batch_size=1; then min==max)
-            p = params.numpy()   # shape (B, 5)
+            p = params.numpy()   # Physical theta: 5, 6, or 7 columns.
 
             tau_min, tau_max     = float(p[:,0].min()), float(p[:,0].max())
             T_min, T_max         = float(p[:,1].min()), float(p[:,1].max())
@@ -856,6 +863,10 @@ def main():
                 "theta/sigma_min": sigma_min, "theta/sigma_max": sigma_max,
                 "theta/Bmax_min": Bmax_min, "theta/Bmax_max": Bmax_max,
             })
+
+            for i_ in range(5, args.num_model_parameters):
+                d_scalars[f'theta/{parameter_names[i_]}_min'] = float(p[:, i_].min())
+                d_scalars[f'theta/{parameter_names[i_]}_max'] = float(p[:, i_].max())
 
             for k in dict_avg_loss_recon_items:
                 d_scalars[k] = dict_avg_loss_recon_items[k].result()
@@ -933,36 +944,23 @@ class Sampler:
     '''Class provides user friendly access to low-dimensional space for summary statistics analysis.'''
     def __init__(self, generator=None, iterator=None, **kwargs):
         '''Constructor builds NN model and loads its weights. In addition, a generator with true sun parameters is initialized.'''
-        self.args = ExpSetup() # get experiment parameters from the ExpSetup class in this file. Make sure logdir is accurate.
+        # An explicit checkpoint is authoritative, independent of shell settings.
+        logdir = kwargs['logdir'] if 'logdir' in kwargs else ExpSetup().logdir
         self.basename = kwargs.get('basename', 'model_best_ckpt')
-        if 'logdir' in kwargs:
-            self.args.logdir = kwargs.get('logdir')
-        if not os.path.isdir(self.args.logdir):
-            raise AssertionError('logdir %s from ExpSetup is not found. Quitting.' % self.args.logdir)
-        # Checkpoint metadata remains authoritative when inspecting a legacy
-        # run; all newly trained Fourier-CNN models use Hann preprocessing.
-        hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
+        if not os.path.isdir(logdir):
+            raise AssertionError(f'logdir {logdir} is not found.')
+        hp_manager = Manage_Hyper_Parameters(logdir=logdir)
         if hp_manager.args is None:
-            raise AssertionError(
-                'Hyper-parameter configuration file %s is not found. Quitting.'
-                % hp_manager.param_config_fn
-            )
+            raise AssertionError(f'Hyper-parameter configuration {hp_manager.param_config_fn} is not found.')
         validate_fft4_checkpoint(hp_manager.args)
-        self.args.window = validate_window(getattr(hp_manager.args, 'window', ''))
-        self.args.model = getattr(hp_manager.args, 'model', 'original')
-        self.args.num_model_parameters = getattr(
-            hp_manager.args,
-            'num_model_parameters',
-            6 if self.args.model == 'jupiter' else 5,
-        )
-        self.args.simulation_backend = getattr(
-            hp_manager.args,
-            'simulation_backend',
-            'legacy_enca_explicit_noise',
-        )
-        self.args.Aj_lims = getattr(hp_manager.args, 'Aj_lims', [0.0, 0.1])
-        self.args.jupiter_period = float(getattr(hp_manager.args, 'jupiter_period', 11.86))
-        self.check_hyper_params()
+        phase_config = enca_phase.validate_phase_checkpoint(hp_manager.args)
+        self.args = hp_manager.args
+        self.args.logdir = logdir
+        self.args.__dict__.update(phase_config)
+        self.args.window = validate_window(getattr(self.args, 'window', ''))
+        self.args.model = getattr(self.args, 'model', 'original')
+        self.args.Aj_lims = getattr(self.args, 'Aj_lims', [0.0, 0.1])
+        self.args.jupiter_period = float(getattr(self.args, 'jupiter_period', 11.86))
         self.prng = kwargs.get('prng', np.random.RandomState(1999))
         self.model_obj = None
         self.build_model()
@@ -1082,6 +1080,7 @@ class Sampler:
             Bmax_lims=self.args.Bmax_lims,
             Aj_lims=self.args.Aj_lims,
             model=self.args.model,
+            infer_phase=self.args.infer_phase,
             jupiter_period=self.args.jupiter_period,
         )
 
