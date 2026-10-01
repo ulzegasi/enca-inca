@@ -370,7 +370,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
 
     simulation_backend = "sdde_model_sddeproblem_em_noisegrid_v2"
 
-    def __init__(self, *args, infer_phase=False, **kwargs):
+    def __init__(self, *args, infer_phase=False, phi_lims=(0.0, 2.0 * np.pi), **kwargs):
         super().__init__(*args, **kwargs)
         if not isinstance(infer_phase, bool):
             raise ValueError("infer_phase must be a boolean.")
@@ -379,6 +379,9 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
         # Never read INFER_PHASE implicitly: existing MLP/ENCA callers retain
         # their six-parameter contract even in a phase-enabled shell.
         self.infer_phase = infer_phase
+        self.phi_lims = tuple(float(value) for value in phi_lims)
+        if len(self.phi_lims) != 2 or not np.isfinite(self.phi_lims).all() or self.phi_lims[0] > self.phi_lims[1]:
+            raise ValueError("phi_lims must be a finite ordered pair in radians.")
 
     def _sample_theta(self):
         # The canonical delay solver supports a continuous delay.  Sampling T
@@ -434,7 +437,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             eps_dt = self.prng.normal(0.0, 1.0, size=n_increments).astype(np.float32)
             noise_rows.append(eps_dt)
             if self.model == "jupiter":
-                phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
+                phase = float(self.prng.uniform(*self.phi_lims))
                 simulator_rows.append(theta + (phase,))
                 parameter_rows.append(theta + (phase,) if self.infer_phase else theta)
             else:
@@ -512,7 +515,7 @@ class DataGenerator_SolarDynamo_SDDE_MLP(DataGenerator_SolarDynamo_SDDE_ENCA):
             eps_dt = self.prng.normal(0.0, 1.0, size=n_increments).astype(np.float32)
 
             if self.model == "jupiter":
-                phase = float(self.prng.uniform(0.0, 2.0 * np.pi))
+                phase = float(self.prng.uniform(*self.phi_lims))
                 # sdde_model's canonical simulator API accepts the six inferred
                 # parameters plus the phase as its seventh input.
                 theta_simulator = theta + (phase,)

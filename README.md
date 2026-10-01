@@ -262,7 +262,10 @@ sbatch runtraining_gpu_encafourier4cnn.sh
 
 Set `MODEL=jupiter INFER_PHASE=true` to train summaries for all seven physical
 parameters `(tau, T, Nd, sigma, Bmax, Aj, phi)`. The default phase prior is
-**uniform on `[0, 2*pi)` in radians**. The scalar and threaded batch generators
+**uniform on `[0, 2*pi)` in radians**, configured by `self.phi_lims = (0.0, 2.0 * np.pi)`
+next to `self.Aj_lims` in both trainers. These bounds control phase sampling
+and are saved with the run; changing them requires a fresh run directory.
+The scalar and threaded batch generators
 return the exact phase passed to the simulator, alongside the same driving
 noise. Phi is defined in `cos(2*pi*t/11.86 + phi)` at **simulator t=0, before
 warmup**; this reference must also be used by any later inference code.

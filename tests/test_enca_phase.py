@@ -86,6 +86,29 @@ class PhaseGeneratorTest(unittest.TestCase):
         for a, b in zip(batch, scalar):
             np.testing.assert_array_equal(a, b)
 
+    def test_custom_phase_prior_reaches_both_simulator_apis(self):
+        for batched in (True, False):
+            for enabled in (True, False):
+                captured = []
+                def simulate(theta, eps, **kwargs):
+                    captured.append(np.asarray(theta))
+                    return np.zeros((len(theta), 4)) if batched else np.zeros(4)
+                name = "sn_from_noise_batch" if batched else "sn_from_noise"
+                gen = Generator(model="jupiter", infer_phase=enabled,
+                                phi_lims=(0.3, 0.7), Tobs=4, Twarmup=2,
+                                prng=np.random.RandomState(42))
+                with patch(f"sdde_model.solar_dynamo_jupiter.{name}", side_effect=simulate):
+                    result = gen.sample_batch(8) if batched else next(iter(gen))
+                phases = captured[0][..., -1]
+                self.assertTrue(np.all((phases >= 0.3) & (phases < 0.7)))
+                if enabled:
+                    np.testing.assert_allclose(result[1][..., -1], phases, rtol=1e-6)
+        for limits in ((1, 0), (0, np.inf), (np.nan, 1), (0,)):
+            with self.assertRaisesRegex(ValueError, "phi_lims"):
+                Generator(model="jupiter", phi_lims=limits)
+            with self.assertRaisesRegex(ValueError, "phi_lims"):
+                enca_phase.phase_configuration("jupiter", True, limits)
+
     def test_phase_option_is_explicit_and_only_valid_for_jupiter(self):
         with self.assertRaisesRegex(ValueError, "jupiter"):
             Generator(model="original", infer_phase=True)
@@ -110,6 +133,13 @@ class PhaseTrainingTest(unittest.TestCase):
                 enca_phase.validate_phase_checkpoint(args, args)
                 if enabled:
                     self.assertEqual(args.phase_prior, [0.0, 2*np.pi])
+                    legacy_phase = vars(args).copy()
+                    legacy_phase.pop("phi_lims")
+                    enca_phase.validate_phase_checkpoint(SimpleNamespace(**legacy_phase), args)
+                    changed = SimpleNamespace(**vars(args))
+                    changed.phi_lims = (0.3, 0.7)
+                    with self.assertRaisesRegex(ValueError, "phi_lims"):
+                        enca_phase.validate_phase_checkpoint(args, changed)
                     self.assertEqual(args.supervised_names[-2:], ["sin_phi", "cos_phi"])
                     for key in enca_phase.phase_configuration(model, enabled):
                         missing = vars(args).copy()
@@ -185,6 +215,8 @@ class PhaseTrainingTest(unittest.TestCase):
                 ns["src"].generators.DataGenerator_SolarDynamo_SDDE_Canonical = FakeGenerator
                 with patch.dict(os.environ, {"MODEL": "jupiter", "INFER_PHASE": "true"}, clear=True):
                     args = ns["ExpSetup"]()
+                args.phi_lims = (0.3, 0.7)
+                args.__dict__.update(enca_phase.phase_configuration("jupiter", True, args.phi_lims))
                 args.logdir = directory
                 args.Tobs = args.len_timeseries = 17
                 args.num_fft_components = 9
@@ -211,6 +243,8 @@ class PhaseTrainingTest(unittest.TestCase):
                 self.assertEqual(sampler.model_obj.encoder.output_shape, (None, 8))
                 generator, _ = sampler.build_custom_generator(return_generator=True)
                 self.assertTrue(generator.kwargs["infer_phase"])
+                self.assertEqual(tuple(generator.kwargs["phi_lims"]), (0.3, 0.7))
+                self.assertEqual(saved["phase_prior"], [0.3, 0.7])
                 raw = np.ones((2, 17, 1), dtype=np.float32)
                 latent = sampler.encode(raw)
                 self.assertEqual(sampler.decode((latent, raw)).shape, (2, 9, 1))

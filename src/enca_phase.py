@@ -14,13 +14,16 @@ def parse_infer_phase(value):
     raise ValueError("INFER_PHASE must be true or false (also accepts 1/0 and yes/no).")
 
 
-def phase_configuration(model, infer_phase):
+def phase_configuration(model, infer_phase, phi_lims=(0.0, 2.0 * math.pi)):
     if model not in {"original", "jupiter"}:
         raise ValueError(f"Unknown SDDE model {model!r}.")
     if not isinstance(infer_phase, bool):
         raise ValueError("infer_phase must be a boolean.")
     if infer_phase and model != "jupiter":
         raise ValueError("INFER_PHASE=true requires MODEL=jupiter.")
+    phi_lims = tuple(float(value) for value in phi_lims)
+    if len(phi_lims) != 2 or not all(math.isfinite(v) for v in phi_lims) or phi_lims[0] > phi_lims[1]:
+        raise ValueError("phi_lims must be a finite ordered pair in radians.")
     linear_names = ["tau", "T", "Nd", "sigma", "Bmax"]
     if model == "jupiter":
         linear_names.append("Aj")
@@ -32,7 +35,7 @@ def phase_configuration(model, infer_phase):
         "parameter_names": linear_names + (["phi"] if infer_phase else []),
         "supervised_names": linear_names + (["sin_phi", "cos_phi"] if infer_phase else []),
         "phase_encoding": "sin_cos" if infer_phase else "none",
-        "phase_prior": [0.0, 2.0 * math.pi] if infer_phase else None,
+        "phase_prior": list(phi_lims) if infer_phase else None,
         "phase_reference": "simulator_t0_before_warmup" if infer_phase else None,
         "phase_loss": "range_normalized_pair_mse" if infer_phase else None,
     }
@@ -41,9 +44,15 @@ def phase_configuration(model, infer_phase):
 def validate_phase_checkpoint(saved_args, current_args=None):
     """Old metadata means phase marginalized, never permission to add phase."""
     inferred = getattr(saved_args, "infer_phase", False)
-    expected = phase_configuration(getattr(saved_args, "model", "original"), inferred)
+    # Earlier phase checkpoints saved phase_prior but had no phi_lims field.
+    saved_limits = getattr(saved_args, "phi_lims", None)
+    if saved_limits is None:
+        saved_limits = getattr(saved_args, "phase_prior", None) or (0.0, 2.0 * math.pi)
+    expected = phase_configuration(getattr(saved_args, "model", "original"), inferred, saved_limits)
     if current_args is not None and inferred != current_args.infer_phase:
         raise ValueError("Cannot change INFER_PHASE when resuming; use a fresh run directory.")
+    if current_args is not None and tuple(saved_limits) != tuple(getattr(current_args, "phi_lims", (0.0, 2.0 * math.pi))):
+        raise ValueError("Cannot change phi_lims when resuming; use a fresh run directory.")
     for key, value in expected.items():
         if not hasattr(saved_args, key):
             if inferred:

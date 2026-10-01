@@ -400,6 +400,10 @@ class ExpSetup:
         # --------------------------------------------------------
         self.Bmax_lims = (1.0, 15.0)
         self.Aj_lims = (0.0, 0.1)
+        self.phi_lims = (0.0, 2.0 * np.pi)  # Uniform phase prior, radians (Jupiter).
+        self.__dict__.update(enca_phase.phase_configuration(
+            self.model, self.infer_phase, self.phi_lims
+        ))
 
 ##################################################################################################
 def main():
@@ -429,6 +433,7 @@ def main():
         sigma_lims=args.sigma_lims,
         Bmax_lims=args.Bmax_lims,
         Aj_lims=args.Aj_lims,
+        phi_lims=args.phi_lims,
         model=args.model,
         infer_phase=args.infer_phase,
         jupiter_period=args.jupiter_period,
@@ -936,6 +941,7 @@ class Sampler:
         self.args.window = validate_window(getattr(self.args, 'window', ''))
         self.args.model = getattr(self.args, 'model', 'original')
         self.args.Aj_lims = getattr(self.args, 'Aj_lims', [0.0, 0.1])
+        self.args.phi_lims = getattr(self.args, 'phi_lims', self.args.phase_prior or [0.0, 2.0 * np.pi])
         self.args.jupiter_period = float(getattr(self.args, 'jupiter_period', 11.86))
         self.prng = kwargs.get('prng', np.random.RandomState(1999))
         self.model_obj = None
@@ -1055,6 +1061,7 @@ class Sampler:
             sigma_lims=self.args.sigma_lims,
             Bmax_lims=self.args.Bmax_lims,
             Aj_lims=self.args.Aj_lims,
+            phi_lims=self.args.phi_lims,
             model=self.args.model,
             infer_phase=self.args.infer_phase,
             jupiter_period=self.args.jupiter_period,
