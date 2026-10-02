@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+#SBATCH --job-name=encaf4leaky
+#SBATCH --output=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
+#SBATCH --error=/cfs/earth/scratch/ulzg/enca-inca/txtout/info.%x.%j.%N.info
+#SBATCH --chdir=/cfs/earth/scratch/ulzg/enca-inca
+#
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --time=4-00:00:00
+#SBATCH --partition=earth-5
+#SBATCH --no-requeue
+#SBATCH --constraint=rhel8
+#SBATCH --mail-type=fail,end
+#SBATCH --mail-user=ulzg@zhaw.ch
+#SBATCH --mem=64G
+
+# ==============================
+# Environment setup
+# ==============================
+# IMPORTANT: submit a job using this script from a shell where encainca environment is NOT already activated.
+# Let this script handle conda activation.
+
+. /cfs/earth/scratch/ulzg/enca-inca/load_encainca_env.sh
+
+module load cuda/11.6.2
+
+# Training settings: edit these here, then submit with plain sbatch.
+export MODEL="original"       # original or jupiter
+export INFER_PHASE="false"    # true requires jupiter; false marginalizes phase
+export NDIMS_LATENT=5        # minimum: original=5, Jupiter=6, Jupiter with phase=8
+
+# Separate experiment for decoder collapse; preserve the original run directory.
+export DECODER_ACTIVATION="leaky_relu"  # negative slope 0.1, no extra weights
+export JULIA_NUM_GC_THREADS=1           # provisional workaround for Julia GC aborts
+
+# Run-folder labels. The Python trainer validates the settings above.
+model_label=""
+if [[ "$MODEL" == "jupiter" ]]; then
+  model_label="_jupiter"
+fi
+phase_label=""
+if [[ "$INFER_PHASE" == "true" ]]; then
+  phase_label="_phase"
+fi
+LATENT_TAG="$NDIMS_LATENT"
+
+export JULIA_DEPOT_PATH=/cfs/earth/scratch/ulzg/.julia
+export JULIA_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+# Required by JuliaCall when Julia worker threads execute inside Python.
+export PYTHON_JULIACALL_HANDLE_SIGNALS=yes
+mkdir -p "$JULIA_DEPOT_PATH"
+
+mkdir -p "$TMPDIR"
+mkdir -p /cfs/earth/scratch/ulzg/enca-inca/txtout
+mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs
+
+# New experiments must use a fresh run directory. Replace the automatic stamp
+# only when continuing a checkpoint created with the same model and backend.
+RUNSTAMP=$(date +%Y%m%d)
+export ENCA_FOURIER4_CNN_LOGDIR="/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs/${RUNSTAMP}_encafourier4cnn${model_label}${phase_label}_z${LATENT_TAG}_leaky"
+mkdir -p "$ENCA_FOURIER4_CNN_LOGDIR"
+
+export TF_CPP_MIN_LOG_LEVEL=3
+export TF_ENABLE_ONEDNN_OPTS=0
+
+export MPLCONFIGDIR=/cfs/earth/scratch/ulzg/.cache/matplotlib
+mkdir -p "$MPLCONFIGDIR"
+
+# ==============================
+# Diagnostics
+# ==============================
+echo "Job started at: $(date)"
+echo "Running on host: $(hostname)"
+echo "Working directory: $(pwd)"
+echo "Python used: $(command -v python)"
+python --version
+echo "Julia depot: $JULIA_DEPOT_PATH"
+echo "Julia threads: $JULIA_NUM_THREADS; GC threads: $JULIA_NUM_GC_THREADS"
+echo "DECODER_ACTIVATION=$DECODER_ACTIVATION"
+echo "Julia used: $(command -v julia)"
+julia -v || true
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "MODEL=$MODEL"
+echo "INFER_PHASE=$INFER_PHASE (NDIMS_LATENT=$NDIMS_LATENT)"
+echo "ENCA_FOURIER4_CNN_LOGDIR=$ENCA_FOURIER4_CNN_LOGDIR"
+python -c "import sdde_model; print('Canonical SDDE model:', sdde_model.__file__)"
+nvidia-smi || true
+
+# ==============================
+# Run
+# ==============================
+srun --export=ALL,MODEL="$MODEL",INFER_PHASE="$INFER_PHASE",NDIMS_LATENT="$NDIMS_LATENT",ENCA_FOURIER4_CNN_LOGDIR="$ENCA_FOURIER4_CNN_LOGDIR" --cpu-bind=cores \
+    python train_ENCAfft4CNN_model3.py

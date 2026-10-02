@@ -213,7 +213,8 @@ class PhaseTrainingTest(unittest.TestCase):
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
                 ns, _ = load_trainer(variant)
                 ns["src"].generators.DataGenerator_SolarDynamo_SDDE_Canonical = FakeGenerator
-                with patch.dict(os.environ, {"MODEL": "jupiter", "INFER_PHASE": "true"}, clear=True):
+                with patch.dict(os.environ, {"MODEL": "jupiter", "INFER_PHASE": "true",
+                                             "DECODER_ACTIVATION": "leaky_relu" if variant == 4 else "relu"}, clear=True):
                     args = ns["ExpSetup"]()
                 args.phi_lims = (0.3, 0.7)
                 args.__dict__.update(enca_phase.phase_configuration("jupiter", True, args.phi_lims))
@@ -240,6 +241,9 @@ class PhaseTrainingTest(unittest.TestCase):
                      contextlib.redirect_stdout(io.StringIO()):
                     sampler = ns["Sampler"](logdir=directory)
                 self.assertTrue(sampler.args.infer_phase)
+                if variant == 4:
+                    self.assertEqual(sampler.model_obj.decoder_activation, "leaky_relu")
+                    self.assertEqual(saved["decoder_activation"], "leaky_relu")
                 self.assertEqual(sampler.model_obj.encoder.output_shape, (None, 8))
                 generator, _ = sampler.build_custom_generator(return_generator=True)
                 self.assertTrue(generator.kwargs["infer_phase"])

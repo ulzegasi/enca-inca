@@ -114,8 +114,14 @@ def timeseries_to_fourier_real_imag(x, num_fft_components, window="Hann"):
     return noise_to_fourier_real_imag(x, num_fft_components)
 
 
-def validate_fft4_checkpoint(saved_args):
+def validate_fft4_checkpoint(saved_args, current_args=None):
     """Reject old/raw-noise checkpoints before restoring or renewing metadata."""
+    # Missing metadata denotes the original ReLU architecture.
+    activation = getattr(saved_args, "decoder_activation", "relu")
+    if activation not in {"relu", "leaky_relu"}:
+        raise ValueError(f"Unknown saved decoder_activation: {activation!r}")
+    if current_args is not None and activation != current_args.decoder_activation:
+        raise ValueError("Cannot change decoder_activation when resuming; start a fresh run directory.")
     expected = {
         "representation_mode": "enca_fft4_cnn",
         "encoder_fft_representation": "rfft_real_imag_ortho",
@@ -135,11 +141,15 @@ def validate_fft4_checkpoint(saved_args):
 ##################################################################################################
 class Architecture:
     '''Complex-spectrum encoder and ENCAfft2CNN noise-conditioned decoder.'''
-    def __init__(self, ndims_latent, len_timeseries, num_noise_channels, num_fft_components):
+    def __init__(self, ndims_latent, len_timeseries, num_noise_channels, num_fft_components,
+                 decoder_activation="relu"):
         if len_timeseries < 2 or num_noise_channels < 1:
             raise ValueError("Need at least two time samples and one noise channel.")
         if not 2 <= num_fft_components <= len_timeseries // 2 + 1:
             raise ValueError("num_fft_components must be between 2 and the full rFFT size.")
+        if decoder_activation not in {"relu", "leaky_relu"}:
+            raise ValueError("decoder_activation must be relu or leaky_relu.")
+        self.decoder_activation = decoder_activation
         self.ndims_latent = ndims_latent
         self.len_timeseries = len_timeseries
         self.num_fft_components = num_fft_components
@@ -188,9 +198,13 @@ class Architecture:
         x = tf.keras.layers.Concatenate(axis=-1, name='concatenate_noise_fft_and_summary')(
             [summary_projection, noise_fft]
         )
-        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation='relu', name='dec_conv_1')(x)
-        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation='relu', name='dec_conv_2')(x)
-        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation='relu', name='dec_conv_3')(x)
+        for index, filters in enumerate((32, 32, 16), start=1):
+            activation = (tf.keras.layers.LeakyReLU(negative_slope=0.1)
+                          if self.decoder_activation == "leaky_relu" else "relu")
+            x = tf.keras.layers.Conv1D(
+                filters, 3, padding="same", activation=activation,
+                name=f"dec_conv_{index}",
+            )(x)
         x = tf.keras.layers.Conv1D(1, 3, padding='same', activation=None, name='pred_fourier')(x)
         return tf.keras.Model(inputs=(latent_mappings, noise_vectors), outputs=x)
 
@@ -223,6 +237,7 @@ class Manage_Hyper_Parameters:
         """
         if self.args is None:
             return None
+        validate_fft4_checkpoint(self.args, args)
         enca_phase.validate_phase_checkpoint(self.args, args)
 
         def _norm(v):
@@ -364,6 +379,9 @@ class ExpSetup:
                 f"{self.num_supervised_parameters} supervised coordinates for "
                 f"model={self.model!r}, infer_phase={self.infer_phase}."
             )
+        self.decoder_activation = os.environ.get("DECODER_ACTIVATION", "relu").strip().lower()
+        if self.decoder_activation not in {"relu", "leaky_relu"}:
+            raise ValueError("DECODER_ACTIVATION must be relu or leaky_relu.")
         self.num_fft_components = 100
         # Fourier-CNN ENCA always uses the symmetric Hann preprocessing.
         self.window = "Hann"
@@ -494,6 +512,7 @@ def main():
         len_timeseries=args.len_timeseries,
         num_noise_channels=args.num_noise_channels,
         num_fft_components=args.num_fft_components,
+        decoder_activation=args.decoder_activation,
     )
     model_obj.encoder.summary()
     model_obj.decoder.summary()
@@ -616,7 +635,7 @@ def main():
     ##################################################################################################
     # Restore a previously interrupted training session (if exists)
     if save_manager.latest_checkpoint:
-        validate_fft4_checkpoint(hp_manager.args)
+        validate_fft4_checkpoint(hp_manager.args, args)
         saved_model = (
             getattr(hp_manager.args, "model", None)
             if hp_manager.args is not None
@@ -742,6 +761,7 @@ def main():
     print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
     print(f"infer_phase={args.infer_phase}; supervised targets: {', '.join(args.supervised_names)}")
     print(f"simulation backend: {args.simulation_backend}")
+    print(f"Decoder activation: {args.decoder_activation}")
     print(f"FFT window: {args.window or 'none (legacy)'}")
     print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
 
@@ -1055,6 +1075,7 @@ class Sampler:
             len_timeseries=self.args.len_timeseries,
             num_noise_channels=self.args.num_noise_channels,
             num_fft_components=self.args.num_fft_components,
+            decoder_activation=getattr(self.args, "decoder_activation", "relu"),
         )
 
     def load_model(self, basename='model_best_ckpt'):

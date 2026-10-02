@@ -113,8 +113,9 @@ class FFT4CnnTest(unittest.TestCase):
     def test_actual_training_step_uses_amplitude_target_for_both_losses(self):
         x_encoder, target, params, noise = self.batch_loader()(
             SimpleNamespace(sample_batch=Mock(return_value=(self.raw, self.params, self.noise))), 3)
-        for mode in ("balanced_mse", "legacy_chisq"):
-            with self.subTest(loss_mode=mode):
+        for mode, activation in (("balanced_mse", "relu"), ("legacy_chisq", "relu"),
+                                 ("balanced_mse", "leaky_relu")):
+            with self.subTest(loss_mode=mode, activation=activation):
                 self.args.loss_mode = mode
                 self.args.lambda_recon = self.args.lambda_reg = 1.0
                 self.args.recon_scale_eps = 1e-3
@@ -125,7 +126,7 @@ class FFT4CnnTest(unittest.TestCase):
                     "loss_reconstruction_fn_balanced", "loss_regress_params_fn_balanced",
                     "loss_reconstruction_fn_legacy", "loss_regress_params_fn_legacy",
                 }, namespace, parent="main")
-                model = Architecture(5, 271, 1, 100)
+                model = Architecture(5, 271, 1, 100, decoder_activation=activation)
                 variables = model.encoder.trainable_variables + model.decoder.trainable_variables
                 before = [v.numpy().copy() for v in variables]
                 prediction = model.decoder((model.encoder(x_encoder), noise)).numpy()
@@ -166,6 +167,47 @@ class FFT4CnnTest(unittest.TestCase):
             sampler.iterator = iter(zip(self.raw, self.params, self.noise))
             np.testing.assert_allclose(sampler.reconstruct(3), expected_recon[..., 0], atol=2e-6)
 
+    def test_leaky_decoder_keeps_gradient_when_last_hidden_layer_is_negative(self):
+        # Reproduce the failure mechanism: every last hidden preactivation is negative.
+        for activation in ("relu", "leaky_relu"):
+            model = Architecture(5, 271, 1, 100, decoder_activation=activation)
+            for variable in model.decoder.trainable_variables:
+                variable.assign(tf.ones_like(variable) * 0.05)
+            hidden = model.decoder.get_layer("dec_conv_3")
+            hidden.kernel.assign(tf.zeros_like(hidden.kernel))
+            hidden.bias.assign(-tf.ones_like(hidden.bias))
+            latent = tf.ones((3, 5))
+            with tf.GradientTape() as tape:
+                prediction = model.decoder((latent, tf.constant(self.noise)))
+                loss = tf.reduce_mean(tf.square(prediction - 1.0))
+            gradient = tape.gradient(loss, hidden.kernel)
+            self.assertTrue(np.all(np.isfinite(gradient)))
+            if activation == "relu":
+                self.assertEqual(float(tf.reduce_sum(tf.abs(gradient))), 0.0)
+            else:
+                self.assertGreater(float(tf.reduce_sum(tf.abs(gradient))), 0.0)
+            self.assertEqual(model.encoder.count_params() + model.decoder.count_params(), 11678)
+
+    def test_leaky_checkpoint_roundtrip_and_sampler_uses_saved_activation(self):
+        model = Architecture(5, 271, 1, 100, decoder_activation="leaky_relu")
+        latent = model.encoder(features(self.raw, 100))
+        expected = model.decoder((latent, tf.constant(self.noise)))
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = tf.train.Checkpoint(encoder=model.encoder, decoder=model.decoder).save(
+                str(Path(directory) / "model_ckpt"))
+            sampler = object.__new__(NS["Sampler"])
+            sampler.args = SimpleNamespace(ndims_latent=5, len_timeseries=271,
+                num_noise_channels=1, num_fft_components=100, decoder_activation="leaky_relu")
+            with patch.dict(os.environ, {"DECODER_ACTIVATION": "relu"}):
+                sampler.build_model()
+            restored = sampler.model_obj
+            tf.train.Checkpoint(encoder=restored.encoder, decoder=restored.decoder).restore(prefix).assert_consumed()
+            np.testing.assert_allclose(restored.decoder((latent, tf.constant(self.noise))), expected, atol=1e-6)
+            self.assertEqual(restored.decoder_activation, "leaky_relu")
+            del sampler.args.decoder_activation
+            sampler.build_model()
+            self.assertEqual(sampler.model_obj.decoder_activation, "relu")
+
     def test_default_metadata_and_checkpoint_isolation(self):
         with patch.dict(os.environ, {"MODEL": "original"}, clear=True):
             NS["src"] = SimpleNamespace(generators=SimpleNamespace(
@@ -176,6 +218,15 @@ class FFT4CnnTest(unittest.TestCase):
         self.assertEqual(Path(args.logdir).parent.name, "sdde_ENCAFourier4CNN_runs")
         validate = NS["validate_fft4_checkpoint"]
         validate(args)
+        legacy = SimpleNamespace(**vars(args))
+        del legacy.decoder_activation
+        validate(legacy, args)
+        leaky = SimpleNamespace(**vars(args))
+        leaky.decoder_activation = "leaky_relu"
+        validate(leaky, leaky)
+        for saved, current in ((legacy, leaky), (args, leaky), (leaky, args)):
+            with self.assertRaisesRegex(ValueError, "fresh run"):
+                validate(saved, current)
         for key in ("representation_mode", "encoder_fft_representation",
                     "reconstruction_representation", "noise_fft_representation", "noise_window"):
             modified = vars(args).copy()

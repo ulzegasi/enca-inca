@@ -238,6 +238,27 @@ the 200 complex encoder features: the batch loader provides a separate
 `Sampler.sample`, and `Sampler.reconstruct` all use the complex encoder
 preprocessing. The first `K` bins are retained for both observations and noise.
 
+For a separate decoder-stability experiment, use
+`runtraining_gpu_encafourier4cnn_leaky.sh`. Its settings default to `MODEL="original"`,
+`INFER_PHASE="false"`, `NDIMS_LATENT=5`, and `DECODER_ACTIVATION="leaky_relu"`.
+It uses a separate dated `_z5_leaky` directory and `JULIA_NUM_GC_THREADS=1`
+as a provisional workaround for Julia GC aborts. The GC workaround is still
+being evaluated on the cluster.
+
+The LeakyReLU option applies to **both** original and Jupiter models: edit the
+same launcher's model, phase, and latent settings for a Jupiter experiment.
+It changes only the three decoder hidden activations, using a fixed negative
+slope of 0.1 so negative units retain gradients. Encoder, FFT normalization,
+losses, output layer, and parameter count are unchanged. This addresses the
+observed dead-ReLU mechanism; it does not guarantee long-run convergence.
+Start this experiment fresh rather than resuming the collapsed original run.
+
+`DECODER_ACTIVATION` defaults to `relu` in the trainer. Saved metadata controls
+inference; older checkpoints without this field are treated as `relu`.
+Resuming with a different activation is rejected before metadata or weights
+are overwritten. Existing ReLU Jupiter runs can continue with their original
+launcher and settings.
+
 Direct Python defaults are `MODEL=original` and five supervised latent variables;
 the cluster launcher is currently configured for Jupiter phase inference with
 eight supervised coordinates. Runs are
