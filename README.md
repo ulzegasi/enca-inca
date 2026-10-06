@@ -203,6 +203,108 @@ for Jupiter with phase inference and eight supervised coordinates. Direct Python
 execution without environment settings still defaults to the original model
 with five supervised coordinates.
 
+#### ENCAfft2CNN diagnostics and reconstruction
+
+Both scripts live in the **top-level `enca-inca` directory**, alongside
+`train_ENCAfft2CNN_model3.py`:
+
+- `diag_test_encafourier2cnn.py`: simulate fresh samples from the saved priors,
+  then plot true versus encoder-predicted parameters. Reports correlation,
+  RMSE, and RMSE as a percentage of each parameter's prior range.
+- `recon_test_encafourier2cnn.py`: fix physical parameters, simulate independent
+  noise realizations, and compare the observation's log FFT amplitudes with the
+  decoder reconstruction using the matching driving noise. Reports reconstruction
+  RMSE and normalized MSE; with multiple realizations, plots mean spectra and
+  10–90% bands. This is a spectral reconstruction test, not a time-domain plot.
+
+Run the following commands **from the repository root**, in the configured
+`encainca` environment with Julia and the canonical `sdde_model` package available.
+On the cluster the repository root is `/cfs/earth/scratch/ulzg/enca-inca`.
+These are Python commands, not Slurm submission scripts; use a compute allocation
+when running simulations on the cluster.
+
+For the completed original-model run, test 1,000 fresh observations:
+
+```bash
+python diag_test_encafourier2cnn.py \
+  --logdir sdde_ENCAFourier2CNN_runs/20261001_encafourier2cnn_z5 \
+  --nsamples 1000 --batch 64 --seed 1234 --best
+```
+
+Test reconstruction at one parameter setting with 20 noise realizations:
+
+```bash
+python recon_test_encafourier2cnn.py \
+  --logdir sdde_ENCAFourier2CNN_runs/20261001_encafourier2cnn_z5 \
+  --tau 2 --T 3 --Nd 8 --sigma 0.02 --Bmax 10 \
+  --nseeds 20 --seed 1234 --best
+```
+
+Use the final saved training checkpoint instead of the best checkpoint, and
+choose an output directory:
+
+```bash
+python diag_test_encafourier2cnn.py \
+  --logdir sdde_ENCAFourier2CNN_runs/20261001_encafourier2cnn_z5 \
+  --nsamples 2000 --last \
+  --outdir sdde_ENCAFourier2CNN_runs/20261001_encafourier2cnn_z5/diagnostics/last
+```
+
+For a Jupiter checkpoint **without phase supervision**, use its run directory
+and add `--Aj`, for example:
+
+```bash
+python recon_test_encafourier2cnn.py \
+  --logdir sdde_ENCAFourier2CNN_runs/<jupiter_run_name> \
+  --tau 2 --T 3 --Nd 8 --sigma 0.02 --Bmax 10 --Aj 0.05 \
+  --nseeds 20 --best
+```
+
+Replace `<jupiter_run_name>` with an actual folder. All supplied parameter values
+must lie within that run's saved priors. `--Aj` is required for Jupiter and rejected
+for the original model. The model, architecture, Hann window, and simulation
+settings are read from `hyper_parameters.json`, not from the current training
+launcher's settings. Phase-supervised checkpoints (`infer_phase=true`) are
+explicitly rejected by these scripts; they need circular phase diagnostics.
+
+**Shared CLI options**
+
+| Option | Required / default | Meaning |
+| --- | --- | --- |
+| `--logdir PATH` | Required | Run directory containing metadata and checkpoints. |
+| `--best` | Default when neither selector is given | Load the highest-step saved `model_best_ckpt-*.index`. |
+| `--last` | Optional | Load the highest-step saved `model_ckpt-*.index`. Mutually exclusive with `--best`. |
+| `--seed INT` | `1234` | Seed for fresh simulation draws. |
+| `--outdir PATH` | `<run>/diagnostics` | Directory for plots and numerical results. |
+| `-h`, `--help` | Optional | Show the script's command-line usage. |
+
+**Diagonal-test CLI options**
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--nsamples INT` | `1000` | Number of fresh simulations; must be at least 1. |
+| `--batch INT` | `64` | Encoder inference batch size; does not change simulation count. Must be at least 1. |
+
+**Reconstruction-test CLI options**
+
+| Option | Required / default | Meaning |
+| --- | --- | --- |
+| `--tau FLOAT` | Required | Fixed tau parameter. |
+| `--T FLOAT` | Required | Fixed delay parameter. |
+| `--Nd FLOAT` | Required | Fixed dynamo parameter Nd. |
+| `--sigma FLOAT` | Required | Fixed noise amplitude parameter. |
+| `--Bmax FLOAT` | Required | Fixed Bmax parameter. |
+| `--Aj FLOAT` | Required only for Jupiter | Fixed Jupiter modulation amplitude. |
+| `--nseeds INT` | `1` | Number of realizations; uses seeds `seed` through `seed+nseeds-1`. Must be at least 1. |
+
+Each invocation saves a timestamped PNG plot, JSON metrics (including checkpoint
+and seed), and compressed NPZ arrays. Diagonal NPZ files contain `true_params`,
+`predicted_params`, and the full `latent` vectors; reconstruction NPZ files contain
+`target` and `reconstruction` spectra. These are simulation-based diagnostics,
+not SABC posterior estimates. The scripts use the trainer's exact FFT2
+preprocessing and architecture; the older `*_encafouriercnn.py` helpers do not
+support FFT2 checkpoints.
+
 ### ENCAfft4CNN
 
 `train_ENCAfft4CNN_model3.py` extends ENCAfft2CNN by giving the encoder the
