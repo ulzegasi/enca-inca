@@ -331,8 +331,8 @@ retain their additional supervised coordinates.
 public boundary and computes magnitudes internally, so all paths use the same
 phase-free conditioning.
 
-The trainer sets `JULIA_NUM_GC_THREADS=1` before Julia initialization. Both GPU
-launchers set it as well and default to the original model with five latent
+The trainer sets `JULIA_NUM_GC_THREADS=1` before Julia initialization. The GPU
+launcher sets it as well and defaults to the original model with five latent
 coordinates and LeakyReLU. Run directories include a timestamp and the latent dimension. **Start a fresh run:** previous FFT4 checkpoints reconstructed
 log-amplitudes and used complex noise, so metadata validation rejects them.
 
