@@ -333,12 +333,11 @@ phase-free conditioning.
 
 The trainer sets `JULIA_NUM_GC_THREADS=1` before Julia initialization. Both GPU
 launchers set it as well and default to the original model with five latent
-coordinates and LeakyReLU. Run directories include a timestamp and a
-`complex_mse` label. **Start a fresh run:** previous FFT4 checkpoints reconstructed
+coordinates and LeakyReLU. Run directories include a timestamp and the latent dimension. **Start a fresh run:** previous FFT4 checkpoints reconstructed
 log-amplitudes and used complex noise, so metadata validation rejects them.
 
 ```bash
-MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/complex_mse_new \
+MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/my_new_run \
   python train_ENCAfft4CNN_model3.py
 
 # On the GPU cluster:

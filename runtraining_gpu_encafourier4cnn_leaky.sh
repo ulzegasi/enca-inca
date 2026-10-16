@@ -60,7 +60,7 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs
 # New experiments must use a fresh run directory. Replace the automatic stamp
 # only when continuing a checkpoint created with the same model and backend.
 RUNSTAMP=$(date +%Y%m%d_%H%M%S)
-export ENCA_FOURIER4_CNN_LOGDIR="/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs/${RUNSTAMP}_encafourier4cnn${model_label}${phase_label}_complex_mse_z${LATENT_TAG}_leaky"
+export ENCA_FOURIER4_CNN_LOGDIR="/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs/${RUNSTAMP}_encafourier4cnn${model_label}${phase_label}_z${LATENT_TAG}_leaky"
 mkdir -p "$ENCA_FOURIER4_CNN_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
