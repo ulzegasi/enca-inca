@@ -33,12 +33,12 @@ NS = {"tf": tf, "np": np, "VALID_WINDOWS": ("", "Hann"),
       "os": os, "datetime": datetime, "enca_phase": enca_phase}
 load_definitions(SCRIPT, {
     "Architecture", "Sampler", "ExpSetup", "validate_window",
-    "timeseries_to_fourier_real_imag", "timeseries_to_fourier_log_amplitude",
+    "timeseries_to_fourier_real_imag", "noise_to_fourier_amplitude",
     "noise_to_fourier_real_imag", "validate_fft4_checkpoint",
 }, NS)
 Architecture = NS["Architecture"]
 features = NS["timeseries_to_fourier_real_imag"]
-target_transform = NS["timeseries_to_fourier_log_amplitude"]
+noise_features = NS["noise_to_fourier_amplitude"]
 
 
 class FFT4CnnTest(unittest.TestCase):
@@ -67,10 +67,7 @@ class FFT4CnnTest(unittest.TestCase):
                     actual = features(raw, bins, window=window).numpy()
                     np.testing.assert_allclose(actual, expected, atol=2e-6)
                     np.testing.assert_allclose(features(-raw, bins, window=window), -actual, atol=2e-6)
-                    np.testing.assert_allclose(
-                        target_transform(raw, bins, window=window),
-                        np.log1p(np.abs(spectrum))[..., None], atol=2e-6,
-                    )
+
 
     def test_batch_and_scalar_adapters_keep_input_target_and_noise_distinct(self):
         source = SimpleNamespace(sample_batch=Mock(return_value=(self.raw, self.params, self.noise)))
@@ -79,11 +76,11 @@ class FFT4CnnTest(unittest.TestCase):
         source.sample_batch.assert_called_once_with(3)
         scalar = load_batch(iter(zip(self.raw, self.params, self.noise)), 3)
         self.assertEqual([tuple(t.shape) for t in batched],
-                         [(3, 100, 2), (3, 100, 1), (3, 5), (3, 271, 1)])
+                         [(3, 100, 2), (3, 100, 2), (3, 5), (3, 271, 1)])
         for expected, actual in zip(batched, scalar):
             np.testing.assert_allclose(actual, expected, atol=1e-6)
         np.testing.assert_allclose(batched[0], features(self.raw, 100), atol=1e-6)
-        np.testing.assert_allclose(batched[1], target_transform(self.raw, 100), atol=1e-6)
+        np.testing.assert_allclose(batched[1], features(self.raw, 100), atol=1e-6)
         np.testing.assert_array_equal(batched[2], self.params)
         np.testing.assert_array_equal(batched[3], self.noise)
         bad_source = SimpleNamespace(sample_batch=Mock(
@@ -91,29 +88,28 @@ class FFT4CnnTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 5"):
             load_batch(bad_source, 3)
 
-    def test_encoder_has_200_inputs_and_decoder_matches_fft2(self):
+    def test_encoder_and_decoder_have_200_coordinates_and_noise_has_no_phase(self):
         model = Architecture(5, 271, 1, 100)
         self.assertEqual(model.encoder.input_shape, (None, 100, 2))
         self.assertEqual(model.encoder.output_shape, (None, 5))
-        self.assertEqual(model.decoder.output_shape, (None, 100, 1))
+        self.assertEqual(model.decoder.output_shape, (None, 100, 2))
         latent = model.encoder(features(self.raw, 100))
         probe = tf.keras.Model(model.decoder.inputs,
                                model.decoder.get_layer("concatenate_noise_fft_and_summary").output)
-        self.assertEqual(probe((latent, tf.constant(self.noise))).shape, (3, 100, 3))
-        previous = {"tf": tf}
-        load_definitions("train_ENCAfft2CNN_model3.py",
-                         {"Architecture", "noise_to_fourier_real_imag"}, previous)
-        previous_model = previous["Architecture"](5, 271, 1, 100)
-        previous_model.decoder.set_weights(model.decoder.get_weights())
-        np.testing.assert_allclose(
-            previous_model.decoder((latent, tf.constant(self.noise))),
-            model.decoder((latent, tf.constant(self.noise))), atol=1e-6,
-        )
+        self.assertEqual(probe((latent, tf.constant(self.noise))).shape, (3, 100, 2))
+        expected = np.abs(np.fft.rfft(self.noise[..., 0], axis=1)[:, :100]) / np.sqrt(271)
+        np.testing.assert_allclose(noise_features(self.noise, 100)[..., 0], expected, atol=2e-6)
+        # Circular shifts change phase but leave decoder conditioning unchanged.
+        shifted = np.roll(self.noise, 17, axis=1)
+        np.testing.assert_allclose(noise_features(shifted, 100), noise_features(self.noise, 100), atol=2e-6)
+        np.testing.assert_allclose(model.decoder((latent, tf.constant(shifted))),
+                                   model.decoder((latent, tf.constant(self.noise))), atol=2e-6)
 
-    def test_actual_training_step_uses_amplitude_target_for_both_losses(self):
+
+    def test_actual_training_step_reconstructs_complex_input(self):
         x_encoder, target, params, noise = self.batch_loader()(
             SimpleNamespace(sample_batch=Mock(return_value=(self.raw, self.params, self.noise))), 3)
-        for mode, activation in (("balanced_mse", "relu"), ("legacy_chisq", "relu"),
+        for mode, activation in (("mse", "leaky_relu"), ("balanced_mse", "relu"), ("legacy_chisq", "relu"),
                                  ("balanced_mse", "leaky_relu")):
             with self.subTest(loss_mode=mode, activation=activation):
                 self.args.loss_mode = mode
@@ -130,11 +126,13 @@ class FFT4CnnTest(unittest.TestCase):
                 variables = model.encoder.trainable_variables + model.decoder.trainable_variables
                 before = [v.numpy().copy() for v in variables]
                 prediction = model.decoder((model.encoder(x_encoder), noise)).numpy()
-                if mode == "balanced_mse":
+                if mode == "mse":
+                    expected = np.mean((target.numpy() - prediction)**2)
+                elif mode == "balanced_mse":
                     scale = np.maximum(np.sqrt(np.mean(target.numpy()**2, axis=1, keepdims=True)), 1e-3)
                     expected = np.mean(((target.numpy() - prediction) / scale)**2)
                 else:
-                    expected = np.mean((target.numpy() - prediction)**2 / np.maximum(target.numpy()**2, 1e-6))
+                    expected = 2 * np.mean((target.numpy() - prediction)**2 / np.maximum(target.numpy()**2, 1e-6))
                 optimizer = tf.keras.optimizers.Adam(1e-3)
                 losses, outputs, _ = namespace["train_step"](
                     model, x_encoder, target, params, noise, optimizer)
@@ -143,6 +141,17 @@ class FFT4CnnTest(unittest.TestCase):
                 self.assertEqual(outputs[1].shape, target.shape)
                 self.assertEqual(int(optimizer.iterations.numpy()), 1)
                 self.assertTrue(any(not np.array_equal(old, new.numpy()) for old, new in zip(before, variables)))
+
+    def test_regression_supervises_only_first_five_latents(self):
+        namespace = dict(NS, args=self.args, param_widths=tf.constant([1., 2., 3., 4., 5.]))
+        load_definitions(SCRIPT, {"loss_regress_params_fn_balanced"}, namespace, parent="main")
+        latent = tf.Variable(np.concatenate([self.params + 1, np.ones((3, 2)) * 99], axis=1), dtype=tf.float32)
+        with tf.GradientTape() as tape:
+            loss = namespace["loss_regress_params_fn_balanced"](tf.constant(self.params), latent)
+        np.testing.assert_allclose(loss, np.mean(1 / np.arange(1, 6)**2), rtol=1e-6)
+        gradient = tape.gradient(loss, latent).numpy()
+        np.testing.assert_array_equal(gradient[:, 5:], 0)
+        self.assertTrue(np.all(gradient[:, :5] != 0))
 
     def test_checkpoint_roundtrip_and_all_sampler_paths(self):
         model = Architecture(5, 271, 1, 100)
@@ -165,7 +174,7 @@ class FFT4CnnTest(unittest.TestCase):
             np.testing.assert_allclose(sampled_latent, expected_latent, atol=2e-6)
             np.testing.assert_array_equal(sampled_noise, self.noise)
             sampler.iterator = iter(zip(self.raw, self.params, self.noise))
-            np.testing.assert_allclose(sampler.reconstruct(3), expected_recon[..., 0], atol=2e-6)
+            np.testing.assert_allclose(sampler.reconstruct(3), expected_recon, atol=2e-6)
 
     def test_leaky_decoder_keeps_gradient_when_last_hidden_layer_is_negative(self):
         # Reproduce the failure mechanism: every last hidden preactivation is negative.
@@ -186,7 +195,7 @@ class FFT4CnnTest(unittest.TestCase):
                 self.assertEqual(float(tf.reduce_sum(tf.abs(gradient))), 0.0)
             else:
                 self.assertGreater(float(tf.reduce_sum(tf.abs(gradient))), 0.0)
-            self.assertEqual(model.encoder.count_params() + model.decoder.count_params(), 11678)
+            self.assertEqual(model.encoder.count_params() + model.decoder.count_params(), 11631)
 
     def test_leaky_checkpoint_roundtrip_and_sampler_uses_saved_activation(self):
         model = Architecture(5, 271, 1, 100, decoder_activation="leaky_relu")
@@ -213,6 +222,8 @@ class FFT4CnnTest(unittest.TestCase):
             NS["src"] = SimpleNamespace(generators=SimpleNamespace(
                 DataGenerator_SolarDynamo_SDDE_Canonical=SimpleNamespace(simulation_backend="test")))
             args = NS["ExpSetup"]()
+        self.assertEqual(args.loss_mode, "mse")
+        self.assertEqual(args.decoder_activation, "leaky_relu")
         self.assertEqual(args.ndims_latent, 5)
         self.assertEqual(args.num_fft_components, 100)
         self.assertEqual(Path(args.logdir).parent.name, "sdde_ENCAFourier4CNN_runs")
@@ -220,11 +231,13 @@ class FFT4CnnTest(unittest.TestCase):
         validate(args)
         legacy = SimpleNamespace(**vars(args))
         del legacy.decoder_activation
-        validate(legacy, args)
+        relu = SimpleNamespace(**vars(args))
+        relu.decoder_activation = "relu"
+        validate(legacy, relu)
         leaky = SimpleNamespace(**vars(args))
         leaky.decoder_activation = "leaky_relu"
         validate(leaky, leaky)
-        for saved, current in ((legacy, leaky), (args, leaky), (leaky, args)):
+        for saved, current in ((legacy, leaky), (relu, leaky), (leaky, relu)):
             with self.assertRaisesRegex(ValueError, "fresh run"):
                 validate(saved, current)
         for key in ("representation_mode", "encoder_fft_representation",
@@ -233,6 +246,10 @@ class FFT4CnnTest(unittest.TestCase):
             modified.pop(key)
             with self.assertRaises(ValueError):
                 validate(SimpleNamespace(**modified))
+        old = SimpleNamespace(**vars(args))
+        old.reconstruction_representation = "log1p_abs_rfft"
+        with self.assertRaises(ValueError):
+            validate(old)
         args.representation_mode = "enca_fft2_cnn"
         with self.assertRaisesRegex(ValueError, "ENCA_FOURIER4_CNN_LOGDIR"):
             validate(args)

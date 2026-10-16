@@ -14,7 +14,7 @@ The repository contains the code needed to train the proposed models _explicit n
 - `train_ENCA_model3.py`: solar-dynamo / SDDE ENCA experiments using the Julia-backed simulator
 - `train_ENCAFourierCNN_model3.py`: Fourier-space SDDE ENCA with a noise-conditioned CNN decoder
 - `train_ENCAfft2CNN_model3.py`: log-amplitude encoder with real/imaginary noise FFT conditioning
-- `train_ENCAfft4CNN_model3.py`: real/imaginary observation FFT encoder with the same decoder as ENCAfft2CNN
+- `train_ENCAfft4CNN_model3.py`: real/imaginary FFT autoencoder conditioned on noise amplitudes
 - `train_MLP_model3.py`: solar-dynamo / SDDE MLP experiments on Fourier-amplitude representations
 - `train_FNO_model3.py`: solar-dynamo / SDDE FNO experiments with configurable time- or Fourier-domain reconstruction loss
 
@@ -307,74 +307,38 @@ support FFT2 checkpoints.
 
 ### ENCAfft4CNN
 
-`train_ENCAfft4CNN_model3.py` extends ENCAfft2CNN by giving the encoder the
-**real and imaginary parts of the observed spectrum**, rather than only its
-log-amplitudes. This makes phase information available when learning the summary
-statistics. Real/imaginary channels avoid the angular discontinuity at the
-phase wrap in an amplitude/phase representation.
+`train_ENCAfft4CNN_model3.py` now reconstructs the same complex FFT features
+that it encodes:
 
-For `N=271`, `K=100`, five latent variables, and one noise channel:
+1. Simulator time series → symmetric Hann window → rFFT / sqrt(N).
+2. Keep the first 100 bins, including DC, as `[100, 2]` Re/Im pairs (200 real numbers).
+3. Encode into `NDIMS_LATENT` coordinates (default 5). For `MODEL=original`,
+   the first five regress the simulator parameters; extra coordinates are free.
+4. Project the latent vector to 100 values and concatenate with the first
+   100 **magnitudes** of the unwindowed noise rFFT / sqrt(N). No noise phase
+   or logarithmic compression reaches the decoder CNN.
+5. Decode to `[100, 2]` signed Re/Im pairs, with a linear output layer.
 
-| Stage | ENCAfft2CNN | ENCAfft4CNN |
-| --- | --- | --- |
-| Encoder features | `log1p(abs(rFFT(Hann(x))))[:K]` | Re/Im of `rFFT(Hann(x))[:K] / sqrt(N)` |
-| Encoder input per sample | `[100, 1]`: 100 numbers | `[100, 2]`: 200 numbers |
-| Latent representation | 5 numbers | 5 numbers |
-| Decoder CNN input per sample | `[100, 3]`: 300 numbers | Same: projected latent + Re/Im noise FFT |
-| Reconstruction target and output | `[100, 1]`: 100 observation log-amplitudes | Same |
+Encoder hidden layers use LeakyReLU with slope 0.1. Decoder hidden layers default
+to the same activation (`DECODER_ACTIVATION=leaky_relu`). The default loss is
+`lambda_recon * mean((FFT_target - FFT_prediction)^2) + lambda_reg * mean(((parameters - z[:5]) / prior_widths)^2)`,
+with both weights equal to 1. Reconstruction MSE averages over batch, bins,
+and both channels, without per-bin or per-sample normalization. Jupiter modes
+retain their additional supervised coordinates.
 
-All Re/Im FFT coefficients, for both observations and noise, use the fixed
-`1/sqrt(N)` normalization. Observations receive the symmetric Hann window;
-noise remains unwindowed. The encoder coefficients retain their signs and have
-no logarithmic compression or per-realization standardization. Consequently,
-this experiment changes the encoder's numerical representation as well as
-adding phase information; it is not a comparison with identical feature scales.
-When phase is marginalized, it can encode timing variation that the summaries
-must learn to ignore; when inferring phase, that timing can be relevant signal.
-Any benefit to parameter recovery must be measured.
+`Sampler.encode` uses the same preprocessing as training; `decode` and
+`reconstruct` return Re/Im pairs. The decoder accepts raw simulator noise at its
+public boundary and computes magnitudes internally, so all paths use the same
+phase-free conditioning.
 
-The decoder architecture, noise preprocessing, reconstruction target, and losses
-remain those of ENCAfft2CNN. In particular, the decoder does **not** reconstruct
-the 200 complex encoder features: the batch loader provides a separate
-`log1p(abs(rFFT(Hann(x))))[:K]` target. Training, `Sampler.encode`,
-`Sampler.sample`, and `Sampler.reconstruct` all use the complex encoder
-preprocessing. The first `K` bins are retained for both observations and noise.
-
-For a separate decoder-stability experiment, use
-`runtraining_gpu_encafourier4cnn_leaky.sh`. Its settings default to `MODEL="original"`,
-`INFER_PHASE="false"`, `NDIMS_LATENT=5`, and `DECODER_ACTIVATION="leaky_relu"`.
-It uses a separate dated `_z5_leaky` directory and `JULIA_NUM_GC_THREADS=1`
-as a provisional workaround for Julia GC aborts. The GC workaround is still
-being evaluated on the cluster.
-
-The LeakyReLU option applies to **both** original and Jupiter models: edit the
-same launcher's model, phase, and latent settings for a Jupiter experiment.
-It changes only the three decoder hidden activations, using a fixed negative
-slope of 0.1 so negative units retain gradients. Encoder, FFT normalization,
-losses, output layer, and parameter count are unchanged. This addresses the
-observed dead-ReLU mechanism; it does not guarantee long-run convergence.
-Start this experiment fresh rather than resuming the collapsed original run.
-
-`DECODER_ACTIVATION` defaults to `relu` in the trainer. Saved metadata controls
-inference; older checkpoints without this field are treated as `relu`.
-Resuming with a different activation is rejected before metadata or weights
-are overwritten. Existing ReLU Jupiter runs can continue with their original
-launcher and settings.
-
-Direct Python defaults are `MODEL=original` and five supervised latent variables;
-the cluster launcher is currently configured for Jupiter phase inference with
-eight supervised coordinates. Runs are
-stored under `sdde_ENCAFourier4CNN_runs/`; use `ENCA_FOURIER4_CNN_LOGDIR` to
-override the run directory. Checkpoint metadata distinguishes the encoder,
-noise, and reconstruction representations with `representation_mode="enca_fft4_cnn"`,
-`encoder_fft_representation="rfft_real_imag_ortho"`,
-`noise_fft_representation="rfft_real_imag_ortho"`, and
-`reconstruction_representation="log1p_abs_rfft"`. Earlier ENCA variants cannot
-be resumed as ENCAfft4CNN. Use this script's `Sampler` for inference; existing
-ENCAfftCNN diagnostic scripts do not load this variant.
+The trainer sets `JULIA_NUM_GC_THREADS=1` before Julia initialization. Both GPU
+launchers set it as well and default to the original model with five latent
+coordinates and LeakyReLU. Run directories include a timestamp and a
+`complex_mse` label. **Start a fresh run:** previous FFT4 checkpoints reconstructed
+log-amplitudes and used complex noise, so metadata validation rejects them.
 
 ```bash
-MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/my_run \
+MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/complex_mse_new \
   python train_ENCAfft4CNN_model3.py
 
 # On the GPU cluster:

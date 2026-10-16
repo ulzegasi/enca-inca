@@ -1,14 +1,12 @@
 # Author: Simone Ulzega, February 2026, simone.ulzega@zhaw.ch
-# ENCAfft4CNN: complex observation spectra and complex noise conditioning.
-################
-# The encoder receives Re/Im of rFFT(Hann(x)) / sqrt(N), retaining phase.
-# The decoder is identical to ENCAfft2CNN: projected latent summaries plus
-# Re/Im of the unwindowed noise rFFT / sqrt(N). Its reconstruction target
-# remains log1p(abs(rFFT(Hann(x)))), NOT the complex encoder input.
+# ENCAfft4CNN: reconstruct complex observation spectra from latent variables
+# and phase-free noise magnitudes. Input and target are identical Re/Im pairs
+# of rFFT(Hann(x))[:100] / sqrt(N).
 
 # IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JULIA_NUM_GC_THREADS"] = "1"  # Must precede Julia initialization.
 
 from sdde_model import init_julia
 init_julia()
@@ -64,22 +62,12 @@ def validate_window(window):
     return window
 
 
-def timeseries_to_fourier_log_amplitude(x, num_fft_components, window="Hann"):
-    """Map [batch, time, 1] signals to log1p rFFT magnitudes [batch, n_fft, 1].
-
-    New training always uses the default symmetric Hann window. An explicit
-    empty value remains supported only when inspecting a legacy checkpoint.
-    """
-    validate_window(window)
-    x = tf.convert_to_tensor(x, dtype=tf.float32)
-    x_1d = tf.squeeze(x, axis=-1)
-    if window == "Hann":
-        n_time = tf.shape(x_1d)[1]
-        hann = tf.signal.hann_window(n_time, periodic=False, dtype=x_1d.dtype)
-        x_1d = x_1d * hann[tf.newaxis, :]
-    spectrum = tf.signal.rfft(x_1d)
-    amplitudes = tf.abs(spectrum)[:, :num_fft_components]
-    return tf.expand_dims(tf.math.log1p(amplitudes), axis=-1)
+def noise_to_fourier_amplitude(noise, num_fft_components):
+    """Unwindowed |rFFT(noise)| / sqrt(N), with no phase or logarithm."""
+    noise = tf.convert_to_tensor(noise, dtype=tf.float32)
+    spectrum = tf.signal.rfft(tf.transpose(noise, [0, 2, 1]))
+    amplitude = tf.abs(spectrum) / tf.sqrt(tf.cast(tf.shape(noise)[1], noise.dtype))
+    return tf.transpose(amplitude[:, :, :num_fft_components], [0, 2, 1])
 
 
 def noise_to_fourier_real_imag(noise, num_fft_components):
@@ -125,8 +113,8 @@ def validate_fft4_checkpoint(saved_args, current_args=None):
     expected = {
         "representation_mode": "enca_fft4_cnn",
         "encoder_fft_representation": "rfft_real_imag_ortho",
-        "reconstruction_representation": "log1p_abs_rfft",
-        "noise_fft_representation": "rfft_real_imag_ortho",
+        "reconstruction_representation": "rfft_real_imag_ortho",
+        "noise_fft_representation": "abs_rfft_ortho",
         "noise_window": "",
     }
     for key, value in expected.items():
@@ -140,9 +128,9 @@ def validate_fft4_checkpoint(saved_args, current_args=None):
 
 ##################################################################################################
 class Architecture:
-    '''Complex-spectrum encoder and ENCAfft2CNN noise-conditioned decoder.'''
+    '''Complex-spectrum autoencoder conditioned on phase-free noise amplitudes.'''
     def __init__(self, ndims_latent, len_timeseries, num_noise_channels, num_fft_components,
-                 decoder_activation="relu"):
+                 decoder_activation="leaky_relu"):
         if len_timeseries < 2 or num_noise_channels < 1:
             raise ValueError("Need at least two time samples and one noise channel.")
         if not 2 <= num_fft_components <= len_timeseries // 2 + 1:
@@ -165,11 +153,11 @@ class Architecture:
             shape=[self.num_fft_components, self.num_input_channels],
             name='fourier_real_imag',
         )
-        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation='relu', name='enc_conv_1')(x_input)
-        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation='relu', name='enc_conv_2')(x)
+        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_1')(x_input)
+        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_2')(x)
         x = tf.keras.layers.MaxPool1D(pool_size=2, name='enc_maxpool')(x)
-        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation='relu', name='enc_conv_3')(x)
-        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation='relu', name='enc_conv_4')(x)
+        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_3')(x)
+        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_4')(x)
         x = tf.keras.layers.Conv1D(
             self.ndims_latent, 3, padding='same', activation=None, name='latent_channels'
         )(x)
@@ -177,7 +165,7 @@ class Architecture:
         return tf.keras.Model(inputs=x_input, outputs=latent_space)
 
     def decoder_fn(self):
-        '''Reconstruct a Fourier log-magnitude from summaries and simulator noise.'''
+        '''Reconstruct signed Re/Im pairs from summaries and noise magnitudes.'''
         latent_mappings = tf.keras.layers.Input(shape=[self.ndims_latent], name='latent_representations')
         noise_vectors = tf.keras.layers.Input(shape=[self.len_timeseries, self.num_noise_channels], name='noise_vectors')
 
@@ -191,9 +179,9 @@ class Architecture:
         # Keep raw noise at the public model boundary so training and Sampler
         # share this exact transform. The CNN receives only the FFT channels.
         noise_fft = tf.keras.layers.Lambda(
-            lambda noise: noise_to_fourier_real_imag(noise, self.num_fft_components),
-            output_shape=(self.num_fft_components, 2 * self.num_noise_channels),
-            name='noise_fft_real_imag',
+            lambda noise: noise_to_fourier_amplitude(noise, self.num_fft_components),
+            output_shape=(self.num_fft_components, self.num_noise_channels),
+            name='noise_fft_amplitude',
         )(noise_vectors)
         x = tf.keras.layers.Concatenate(axis=-1, name='concatenate_noise_fft_and_summary')(
             [summary_projection, noise_fft]
@@ -205,7 +193,7 @@ class Architecture:
                 filters, 3, padding="same", activation=activation,
                 name=f"dec_conv_{index}",
             )(x)
-        x = tf.keras.layers.Conv1D(1, 3, padding='same', activation=None, name='pred_fourier')(x)
+        x = tf.keras.layers.Conv1D(2, 3, padding='same', activation=None, name='pred_fourier')(x)
         return tf.keras.Model(inputs=(latent_mappings, noise_vectors), outputs=x)
 
 ##################################################################################################
@@ -379,7 +367,7 @@ class ExpSetup:
                 f"{self.num_supervised_parameters} supervised coordinates for "
                 f"model={self.model!r}, infer_phase={self.infer_phase}."
             )
-        self.decoder_activation = os.environ.get("DECODER_ACTIVATION", "relu").strip().lower()
+        self.decoder_activation = os.environ.get("DECODER_ACTIVATION", "leaky_relu").strip().lower()
         if self.decoder_activation not in {"relu", "leaky_relu"}:
             raise ValueError("DECODER_ACTIVATION must be relu or leaky_relu.")
         self.num_fft_components = 100
@@ -387,8 +375,8 @@ class ExpSetup:
         self.window = "Hann"
         self.representation_mode = "enca_fft4_cnn"
         self.encoder_fft_representation = "rfft_real_imag_ortho"
-        self.reconstruction_representation = "log1p_abs_rfft"
-        self.noise_fft_representation = "rfft_real_imag_ortho"
+        self.reconstruction_representation = "rfft_real_imag_ortho"
+        self.noise_fft_representation = "abs_rfft_ortho"
         self.noise_window = ""  # Preserve the supplied noise; Hann is only for observations.
         self.simulation_backend = (
             src.generators.DataGenerator_SolarDynamo_SDDE_Canonical.simulation_backend
@@ -418,9 +406,10 @@ class ExpSetup:
         self.freq_log = 500
 
         # Loss setup
-        # "legacy_chisq" reproduces the original implementation.
+        # "mse" averages squared errors over all 200 signed FFT coordinates.
+        # The other modes are retained for explicit experiments.
         # "balanced_mse" uses normalized MSEs with comparable reductions.
-        self.loss_mode = "balanced_mse"
+        self.loss_mode = "mse"
         self.lambda_recon = 1.0
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
@@ -499,10 +488,7 @@ def main():
         x_encoder = timeseries_to_fourier_real_imag(
             x_raw, args.num_fft_components, window=args.window
         )
-        # Keep the amplitude target distinct from the complex encoder input.
-        x = timeseries_to_fourier_log_amplitude(
-            x_raw, args.num_fft_components, window=args.window
-        )
+        x = x_encoder  # Reconstruct exactly the 200 encoder inputs.
         return x_encoder, x, params, noise
 
     ##################################################################################################
@@ -683,12 +669,20 @@ def main():
     # wrap a training step for performance gains.
     @tf.function
     def train_step(model, x_encoder, x, params, noise, optimizer):
-        """Encode complex features and reconstruct the separate log-amplitude target."""
+        """Reconstruct the encoder Re/Im inputs and supervise leading latent coordinates."""
         with tf.GradientTape(persistent=False) as tape:
             z_latent = model.encoder(x_encoder, training=True)
             x_reconst = model.decoder((z_latent, noise), training=True)
 
-            if args.loss_mode == "legacy_chisq":
+            if args.loss_mode == "mse":
+                dict_reconstruction = {
+                    f'MSE_x_ch_{i+1}': tf.reduce_mean(tf.square(x[..., i] - x_reconst[..., i]))
+                    for i in range(2)
+                }
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            elif args.loss_mode == "legacy_chisq":
                 dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
                 loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
 
@@ -755,7 +749,7 @@ def main():
     print("Batch finiteness: OK")
 
     print("encoder Re/Im stats:", float(tf.reduce_min(x_encoder)), float(tf.reduce_max(x_encoder)), float(tf.reduce_mean(x_encoder)))
-    print("target log-amplitude stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
+    print("target Re/Im stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
     print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
     print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
     print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
@@ -1030,14 +1024,14 @@ class Sampler:
         return o_latent
 
     def reconstruct(self, num_samples=10, params=None):
-        '''Return reconstructed log-magnitude spectra with shape [num_samples, num_fft_components].'''
+        '''Return Re/Im spectra with shape [num_samples, num_fft_components, 2].'''
         if params is None: # if none, fallback to default generator of the class instance
             if self.iterator is None:
                 raise AssertionError('iterator is not defined. You must provide a parameter dict for the generator.')
             iterator = self.iterator
         else:
             _, iterator = self.build_custom_generator(return_generator=True, **params)
-        ndarray_timeseries = np.zeros((num_samples, self.args.num_fft_components))
+        ndarray_timeseries = np.zeros((num_samples, self.args.num_fft_components, 2))
         for i in range(num_samples):
             b = next(iterator) # sample contains a tuple of form (x, params, noise)
             x_i = np.expand_dims(b[0], axis=0).astype(np.float32)
@@ -1051,7 +1045,7 @@ class Sampler:
         return ndarray_timeseries
 
     def decode(self, tuple_summary_and_noise):
-        '''Reconstruct from (latent, raw noise); the decoder computes Re/Im rFFT internally.'''
+        '''Reconstruct from (latent, raw noise); the decoder computes phase-free rFFT magnitudes internally.'''
         o_latent = tf.convert_to_tensor(tuple_summary_and_noise[0], dtype=tf.float32)
         noise_i = tf.convert_to_tensor(tuple_summary_and_noise[1], dtype=tf.float32)
         o_reconst = self.model_obj.decoder((o_latent, noise_i), training=False).numpy()

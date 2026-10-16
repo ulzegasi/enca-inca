@@ -28,9 +28,10 @@
 module load cuda/11.6.2
 
 # Training settings: edit these here, then submit with plain sbatch.
-export MODEL="jupiter"       # original or jupiter
-export INFER_PHASE="true"    # true requires jupiter; false marginalizes phase
-export NDIMS_LATENT=8        # minimum: original=5, Jupiter=6, Jupiter with phase=8
+export MODEL="original"       # original or jupiter
+export INFER_PHASE="false"    # true requires jupiter; false marginalizes phase
+export DECODER_ACTIVATION="leaky_relu"
+export NDIMS_LATENT=5        # minimum: original=5, Jupiter=6, Jupiter with phase=8
 
 # Run-folder labels. The Python trainer validates the settings above.
 model_label=""
@@ -57,8 +58,8 @@ mkdir -p /cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs
 
 # New experiments must use a fresh run directory. Replace the automatic stamp
 # only when continuing a checkpoint created with the same model and backend.
-RUNSTAMP=$(date +%Y%m%d)
-export ENCA_FOURIER4_CNN_LOGDIR="${ENCA_FOURIER4_CNN_LOGDIR:-/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs/${RUNSTAMP}_encafourier4cnn${model_label}${phase_label}_z${LATENT_TAG}}"
+RUNSTAMP=$(date +%Y%m%d_%H%M%S)
+export ENCA_FOURIER4_CNN_LOGDIR="${ENCA_FOURIER4_CNN_LOGDIR:-/cfs/earth/scratch/ulzg/enca-inca/sdde_ENCAFourier4CNN_runs/${RUNSTAMP}_encafourier4cnn${model_label}${phase_label}_complex_mse_z${LATENT_TAG}}"
 mkdir -p "$ENCA_FOURIER4_CNN_LOGDIR"
 
 export TF_CPP_MIN_LOG_LEVEL=3
