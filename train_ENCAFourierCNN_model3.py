@@ -302,7 +302,7 @@ class ExpSetup:
         # Keep the latent width explicitly configured here. For Jupiter the
         # first six coordinates are supervised; any additional hard-coded
         # coordinates remain free SABC statistics.
-        self.ndims_latent = 6
+        self.ndims_latent = 7
         self.num_noise_channels = 1
         self.num_model_parameters = 6 if self.model == "jupiter" else 5
         if self.ndims_latent < self.num_model_parameters:
