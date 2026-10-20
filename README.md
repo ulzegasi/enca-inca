@@ -320,11 +320,22 @@ that it encodes:
 5. Decode to `[100, 2]` signed Re/Im pairs, with a linear output layer.
 
 Encoder hidden layers use LeakyReLU with slope 0.1. Decoder hidden layers default
-to the same activation (`DECODER_ACTIVATION=leaky_relu`). The default loss is
-`lambda_recon * mean((FFT_target - FFT_prediction)^2) + lambda_reg * mean(((parameters - z[:5]) / prior_widths)^2)`,
-with both weights equal to 1. Reconstruction MSE averages over batch, bins,
-and both channels, without per-bin or per-sample normalization. Jupiter modes
-retain their additional supervised coordinates.
+to the same activation (`DECODER_ACTIVATION=leaky_relu`). The default loss mode
+is `complex_nmse`: for each sample, divide the sum of squared complex residuals
+by the target spectral energy, then average over the batch. Re and Im share
+one normalization. In implementation, mean squared coordinate error is divided
+by `max(mean(target**2), recon_scale_eps**2)`, with `recon_scale_eps=1e-3`.
+A zero prediction gives loss 1 when the floor is inactive; exact reconstruction
+gives 0. Inputs and targets retain their original signed FFT values.
+
+The total is `lambda_recon * complex_nmse + lambda_reg * parameter_nmse`, with
+both weights equal to 1. Parameter regression is unchanged: squared error
+normalized by each parameter's prior width. Original-model runs with
+`NDIMS_LATENT=5` supervise all coordinates; `NDIMS_LATENT=6` adds one free
+coordinate trained through reconstruction. Jupiter modes retain their additional
+supervised coordinates. Start each comparison in a fresh run directory.
+Changing loss mode while resuming is rejected; older complex-MSE checkpoints
+remain usable for inference.
 
 `Sampler.encode` uses the same preprocessing as training; `decode` and
 `reconstruct` return Re/Im pairs. The decoder accepts raw simulator noise at its

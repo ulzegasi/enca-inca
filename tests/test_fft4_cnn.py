@@ -109,24 +109,30 @@ class FFT4CnnTest(unittest.TestCase):
     def test_actual_training_step_reconstructs_complex_input(self):
         x_encoder, target, params, noise = self.batch_loader()(
             SimpleNamespace(sample_batch=Mock(return_value=(self.raw, self.params, self.noise))), 3)
-        for mode, activation in (("mse", "leaky_relu"), ("balanced_mse", "relu"), ("legacy_chisq", "relu"),
-                                 ("balanced_mse", "leaky_relu")):
-            with self.subTest(loss_mode=mode, activation=activation):
+        for mode, activation, width in (("complex_nmse", "leaky_relu", 5),
+                                       ("complex_nmse", "leaky_relu", 6),
+                                       ("mse", "leaky_relu", 5),
+                                       ("balanced_mse", "relu", 5),
+                                       ("legacy_chisq", "relu", 5)):
+            with self.subTest(loss_mode=mode, activation=activation, width=width):
                 self.args.loss_mode = mode
                 self.args.lambda_recon = self.args.lambda_reg = 1.0
                 self.args.recon_scale_eps = 1e-3
                 namespace = dict(NS, args=self.args, param_widths=tf.ones(5),
                                  global_gradient_clipnorm=1e5)
                 load_definitions(SCRIPT, {
-                    "ChiSquareStatistic", "train_step",
+                    "ChiSquareStatistic", "train_step", "loss_reconstruction_fn_complex_normalized",
                     "loss_reconstruction_fn_balanced", "loss_regress_params_fn_balanced",
                     "loss_reconstruction_fn_legacy", "loss_regress_params_fn_legacy",
                 }, namespace, parent="main")
-                model = Architecture(5, 271, 1, 100, decoder_activation=activation)
+                model = Architecture(width, 271, 1, 100, decoder_activation=activation)
                 variables = model.encoder.trainable_variables + model.decoder.trainable_variables
                 before = [v.numpy().copy() for v in variables]
                 prediction = model.decoder((model.encoder(x_encoder), noise)).numpy()
-                if mode == "mse":
+                if mode == "complex_nmse":
+                    expected = np.mean(np.sum((target.numpy() - prediction)**2, axis=(1, 2)) /
+                                       np.maximum(np.sum(target.numpy()**2, axis=(1, 2)), 200 * 1e-6))
+                elif mode == "mse":
                     expected = np.mean((target.numpy() - prediction)**2)
                 elif mode == "balanced_mse":
                     scale = np.maximum(np.sqrt(np.mean(target.numpy()**2, axis=1, keepdims=True)), 1e-3)
@@ -141,6 +147,30 @@ class FFT4CnnTest(unittest.TestCase):
                 self.assertEqual(outputs[1].shape, target.shape)
                 self.assertEqual(int(optimizer.iterations.numpy()), 1)
                 self.assertTrue(any(not np.array_equal(old, new.numpy()) for old, new in zip(before, variables)))
+
+    def test_complex_normalization_and_finite_zero_energy_gradients(self):
+        self.args.recon_scale_eps = 1e-3
+        namespace = dict(NS, args=self.args)
+        load_definitions(SCRIPT, {"loss_reconstruction_fn_complex_normalized"}, namespace, parent="main")
+        loss = namespace["loss_reconstruction_fn_complex_normalized"]
+        x = features(self.raw, 100)
+        pred = tf.constant(self.rng.normal(size=x.shape), dtype=tf.float32)
+        np.testing.assert_allclose(loss(x, x), 0, atol=1e-7)
+        np.testing.assert_allclose(loss(x, tf.zeros_like(x)), 1, atol=1e-6)
+        baseline = loss(x, pred)
+        # Independent sample amplitudes must not change their relative weighting.
+        scales = tf.constant([0.1, 2., 100.])[:, None, None]
+        np.testing.assert_allclose(loss(x * scales, pred * scales), baseline, rtol=1e-6)
+        # A common complex rotation must not change the residual's norm.
+        rotation = tf.constant([[0.6, -0.8], [0.8, 0.6]])
+        np.testing.assert_allclose(loss(x @ rotation, pred @ rotation), baseline, rtol=1e-6)
+        contributions = loss(x, pred, return_each_dim=True)
+        np.testing.assert_allclose(tf.reduce_mean(list(contributions.values())), baseline, rtol=1e-6)
+        variable = tf.Variable(tf.ones_like(x))
+        with tf.GradientTape() as tape:
+            zero_loss = loss(tf.zeros_like(x), variable)
+        np.testing.assert_allclose(zero_loss, 1e6, rtol=1e-6)
+        self.assertTrue(np.all(np.isfinite(tape.gradient(zero_loss, variable))))
 
     def test_regression_supervises_only_first_five_latents(self):
         namespace = dict(NS, args=self.args, param_widths=tf.constant([1., 2., 3., 4., 5.]))
@@ -222,7 +252,7 @@ class FFT4CnnTest(unittest.TestCase):
             NS["src"] = SimpleNamespace(generators=SimpleNamespace(
                 DataGenerator_SolarDynamo_SDDE_Canonical=SimpleNamespace(simulation_backend="test")))
             args = NS["ExpSetup"]()
-        self.assertEqual(args.loss_mode, "mse")
+        self.assertEqual(args.loss_mode, "complex_nmse")
         self.assertEqual(args.decoder_activation, "leaky_relu")
         self.assertEqual(args.ndims_latent, 5)
         self.assertEqual(args.num_fft_components, 100)
@@ -246,6 +276,11 @@ class FFT4CnnTest(unittest.TestCase):
             modified.pop(key)
             with self.assertRaises(ValueError):
                 validate(SimpleNamespace(**modified))
+        previous_loss = SimpleNamespace(**vars(args))
+        previous_loss.loss_mode = "mse"
+        validate(previous_loss)  # Inference remains compatible.
+        with self.assertRaisesRegex(ValueError, "loss_mode.*fresh run"):
+            validate(previous_loss, args)
         old = SimpleNamespace(**vars(args))
         old.reconstruction_representation = "log1p_abs_rfft"
         with self.assertRaises(ValueError):

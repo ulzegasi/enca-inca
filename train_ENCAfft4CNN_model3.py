@@ -110,6 +110,8 @@ def validate_fft4_checkpoint(saved_args, current_args=None):
         raise ValueError(f"Unknown saved decoder_activation: {activation!r}")
     if current_args is not None and activation != current_args.decoder_activation:
         raise ValueError("Cannot change decoder_activation when resuming; start a fresh run directory.")
+    if current_args is not None and getattr(saved_args, "loss_mode", None) != current_args.loss_mode:
+        raise ValueError("Cannot change loss_mode when resuming; start a fresh run directory.")
     expected = {
         "representation_mode": "enca_fft4_cnn",
         "encoder_fft_representation": "rfft_real_imag_ortho",
@@ -406,10 +408,11 @@ class ExpSetup:
         self.freq_log = 500
 
         # Loss setup
-        # "mse" averages squared errors over all 200 signed FFT coordinates.
+        # "complex_nmse" divides each sample's complex squared error by its energy.
+        # "mse" retains the previous unnormalized reconstruction objective.
         # The other modes are retained for explicit experiments.
         # "balanced_mse" uses normalized MSEs with comparable reductions.
-        self.loss_mode = "mse"
+        self.loss_mode = "complex_nmse"
         self.lambda_recon = 1.0
         self.lambda_reg = 1.0
         self.recon_scale_eps = 1e-3
@@ -578,6 +581,23 @@ def main():
         return tf.reduce_mean(per_sample_channel)
 
     @tf.function
+    def loss_reconstruction_fn_complex_normalized(x, x_pred, return_each_dim=False):
+        """Per-sample complex error / target energy, then average over batch.
+
+        One shared mean-square scale across frequency AND Re/Im preserves
+        their relative weighting. recon_scale_eps is an RMS floor (squared
+        here); a zero prediction has loss 1 whenever the floor is inactive.
+        Per-channel diagnostics average to the total reconstruction loss.
+        """
+        mean_square = tf.reduce_mean(tf.square(x), axis=[1, 2], keepdims=True)
+        denominator = tf.maximum(mean_square, tf.cast(args.recon_scale_eps ** 2, x.dtype))
+        normalized_error = tf.square(x - x_pred) / denominator
+        per_channel = tf.reduce_mean(normalized_error, axis=[0, 1])
+        if return_each_dim:
+            return {f'ComplexNormMSE_x_ch_{i+1}': per_channel[i] for i in range(2)}
+        return tf.reduce_mean(per_channel)
+
+    @tf.function
     def loss_regress_params_fn_balanced(params, params_pred, return_each_dim=False):
         """Prior-range MSE; sin/cos together count as one physical parameter."""
         infer_phase = getattr(args, "infer_phase", False)
@@ -674,7 +694,12 @@ def main():
             z_latent = model.encoder(x_encoder, training=True)
             x_reconst = model.decoder((z_latent, noise), training=True)
 
-            if args.loss_mode == "mse":
+            if args.loss_mode == "complex_nmse":
+                dict_reconstruction = loss_reconstruction_fn_complex_normalized(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            elif args.loss_mode == "mse":
                 dict_reconstruction = {
                     f'MSE_x_ch_{i+1}': tf.reduce_mean(tf.square(x[..., i] - x_reconst[..., i]))
                     for i in range(2)
