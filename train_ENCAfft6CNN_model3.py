@@ -1,0 +1,1145 @@
+# Author: Simone Ulzega, February 2026, simone.ulzega@zhaw.ch
+# ENCAfft6CNN: reconstruct complex observation spectra from latent variables
+# and complex noise coefficients (both Re and Im). Input and target are identical Re/Im pairs
+# of rFFT(Hann(x))[:100] / sqrt(N).
+
+# IMPORTANT: initialize the canonical SABC SDDE package before TensorFlow.
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JULIA_NUM_GC_THREADS"] = "1"  # Must precede Julia initialization.
+
+from sdde_model import init_julia
+init_julia()
+
+import tensorflow as tf
+assert tf.__version__.startswith("2."), f"TensorFlow 2.x required, got {tf.__version__}"
+tf.get_logger().setLevel("ERROR")
+try:
+    from absl import logging as absl_logging
+    absl_logging.set_verbosity(absl_logging.ERROR)
+    absl_logging.set_stderrthreshold("error")
+except Exception:
+    pass
+
+import glob
+import shutil
+import datetime
+import numpy as np
+import sys
+import json
+import logging
+import time
+
+# --- Configuring Python’s logging system ---
+root = logging.getLogger()
+root.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(message)s')
+handler.setFormatter(formatter)
+root.addHandler(handler)
+
+
+# --- Debugging switch for eager execution ---
+_DEBUG = False
+if _DEBUG:
+    tf.config.run_functions_eagerly(True)
+
+# custom libs
+import src.generators
+import src.utils_tf
+from src import enca_phase
+
+##################################################################################################
+VALID_WINDOWS = ("", "Hann")
+
+
+def validate_window(window):
+    if window not in VALID_WINDOWS:
+        raise ValueError(
+            f"Unknown window {window!r}. Expected an empty string (no window) or 'Hann'."
+        )
+    return window
+
+
+def noise_to_fourier_real_imag(noise, num_fft_components):
+    """Convert [batch, time, channels] noise to [batch, frequency, 2*channels].
+
+    Transform along time, without a window. Divide by sqrt(time length) for
+    orthonormal scaling, then retain the same low-frequency bins as the target.
+    Channel order is [Re(channel 0), ..., Re(channel C-1), Im(channel 0), ...].
+    No magnitudes, logarithms, or interpolation are applied to the noise.
+    """
+    noise = tf.convert_to_tensor(noise, dtype=tf.float32)
+    n_time = tf.shape(noise)[1]
+    spectrum = tf.signal.rfft(tf.transpose(noise, [0, 2, 1]))
+    spectrum /= tf.cast(tf.sqrt(tf.cast(n_time, noise.dtype)), spectrum.dtype)
+    spectrum = tf.transpose(spectrum[:, :, :num_fft_components], [0, 2, 1])
+    return tf.concat([tf.math.real(spectrum), tf.math.imag(spectrum)], axis=-1)
+
+
+def timeseries_to_fourier_real_imag(x, num_fft_components, window="Hann"):
+    """Encode [batch, time, 1] observations as [batch, frequency, 2].
+
+    Apply the same symmetric Hann window as the reconstruction target, then
+    retain signed Re/Im coefficients with fixed 1/sqrt(N) normalization.
+    This preserves phase; no magnitude, logarithm, or per-sample rescaling is
+    applied to the encoder features.
+    """
+    validate_window(window)
+    x = tf.convert_to_tensor(x, dtype=tf.float32)
+    if window == "Hann":
+        hann = tf.signal.hann_window(tf.shape(x)[1], periodic=False, dtype=x.dtype)
+        x = x * hann[tf.newaxis, :, tf.newaxis]
+    return noise_to_fourier_real_imag(x, num_fft_components)
+
+
+def validate_fft6_checkpoint(saved_args, current_args=None):
+    """Reject old/raw-noise checkpoints before restoring or renewing metadata."""
+    # Missing metadata denotes the original ReLU architecture.
+    activation = getattr(saved_args, "decoder_activation", "relu")
+    if activation not in {"relu", "leaky_relu"}:
+        raise ValueError(f"Unknown saved decoder_activation: {activation!r}")
+    if current_args is not None and activation != current_args.decoder_activation:
+        raise ValueError("Cannot change decoder_activation when resuming; start a fresh run directory.")
+    if current_args is not None and getattr(saved_args, "loss_mode", None) != current_args.loss_mode:
+        raise ValueError("Cannot change loss_mode when resuming; start a fresh run directory.")
+    expected = {
+        "representation_mode": "enca_fft6_cnn",
+        "encoder_fft_representation": "rfft_real_imag_ortho",
+        "reconstruction_representation": "rfft_real_imag_ortho",
+        "noise_fft_representation": "rfft_real_imag_ortho",
+        "noise_window": "",
+    }
+    for key, value in expected.items():
+        if getattr(saved_args, key, None) != value:
+            raise ValueError(
+                f"ENCAfft6CNN requires {key}={value!r} in checkpoint metadata. "
+                "Start a fresh ENCA_FOURIER6_CNN_LOGDIR; ENCAfftCNN/ENCAfft2CNN/ENCAfft4CNN checkpoints "
+                "are not compatible with this architecture."
+            )
+
+
+##################################################################################################
+class Architecture:
+    '''Complex-spectrum autoencoder conditioned on complex noise coefficients.'''
+    def __init__(self, ndims_latent, len_timeseries, num_noise_channels, num_fft_components,
+                 decoder_activation="leaky_relu"):
+        if len_timeseries < 2 or num_noise_channels < 1:
+            raise ValueError("Need at least two time samples and one noise channel.")
+        if not 2 <= num_fft_components <= len_timeseries // 2 + 1:
+            raise ValueError("num_fft_components must be between 2 and the full rFFT size.")
+        if decoder_activation not in {"relu", "leaky_relu"}:
+            raise ValueError("decoder_activation must be relu or leaky_relu.")
+        self.decoder_activation = decoder_activation
+        self.ndims_latent = ndims_latent
+        self.len_timeseries = len_timeseries
+        self.num_fft_components = num_fft_components
+        self.num_input_channels = 2
+        self.num_noise_channels = num_noise_channels
+
+        self.encoder = self.encoder_fn()
+        self.decoder = self.decoder_fn()
+
+    def encoder_fn(self):
+        '''Input: [batch, num_fft_components, 2]; output: [batch, ndims_latent].'''
+        x_input = tf.keras.layers.Input(
+            shape=[self.num_fft_components, self.num_input_channels],
+            name='fourier_real_imag',
+        )
+        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_1')(x_input)
+        x = tf.keras.layers.Conv1D(16, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_2')(x)
+        x = tf.keras.layers.MaxPool1D(pool_size=2, name='enc_maxpool')(x)
+        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_3')(x)
+        x = tf.keras.layers.Conv1D(32, 3, padding='same', activation=tf.keras.layers.LeakyReLU(negative_slope=0.1), name='enc_conv_4')(x)
+        x = tf.keras.layers.Conv1D(
+            self.ndims_latent, 3, padding='same', activation=None, name='latent_channels'
+        )(x)
+        latent_space = tf.keras.layers.GlobalAveragePooling1D(name='global_avg_pool')(x)
+        return tf.keras.Model(inputs=x_input, outputs=latent_space)
+
+    def decoder_fn(self):
+        '''Reconstruct signed Re/Im pairs from summaries and complex noise coefficients.'''
+        latent_mappings = tf.keras.layers.Input(shape=[self.ndims_latent], name='latent_representations')
+        noise_vectors = tf.keras.layers.Input(shape=[self.len_timeseries, self.num_noise_channels], name='noise_vectors')
+
+        summary_projection = tf.keras.layers.Dense(
+            self.num_fft_components, activation=None, name='summary_projection'
+        )(latent_mappings)
+        summary_projection = tf.keras.layers.Reshape(
+            [self.num_fft_components, 1], name='summary_projection_shape'
+        )(summary_projection)
+
+        # Keep raw noise at the public model boundary so training and Sampler
+        # share this exact transform. The CNN receives only the FFT channels.
+        noise_fft = tf.keras.layers.Lambda(
+            lambda noise: noise_to_fourier_real_imag(noise, self.num_fft_components),
+            output_shape=(self.num_fft_components, 2 * self.num_noise_channels),
+            name='noise_fft_real_imag',
+        )(noise_vectors)
+        x = tf.keras.layers.Concatenate(axis=-1, name='concatenate_noise_fft_and_summary')(
+            [summary_projection, noise_fft]
+        )
+        for index, filters in enumerate((32, 32, 16), start=1):
+            activation = (tf.keras.layers.LeakyReLU(negative_slope=0.1)
+                          if self.decoder_activation == "leaky_relu" else "relu")
+            x = tf.keras.layers.Conv1D(
+                filters, 3, padding="same", activation=activation,
+                name=f"dec_conv_{index}",
+            )(x)
+        x = tf.keras.layers.Conv1D(2, 3, padding='same', activation=None, name='pred_fourier')(x)
+        return tf.keras.Model(inputs=(latent_mappings, noise_vectors), outputs=x)
+
+##################################################################################################
+class Args_:
+    def __init__(self, d):
+        for k in d.keys():
+            setattr(self, k, d[k])
+
+class Manage_Hyper_Parameters:
+    '''A simple class to manage everything regarding hyper parameter setup of an experiment. Warn for modifications in the experiment setup if training was interrupted.'''
+    def __init__(self, logdir):
+        self.param_config_fn = os.path.join(logdir, 'hyper_parameters.json')
+        if not os.path.isfile(self.param_config_fn):
+            self.args = None
+        else:
+            with open(self.param_config_fn) as fh:
+                args = json.load(fh)
+            self.args = Args_(args) # convert dictionary to a class with attributes (to match code similar with training)
+        self.logdir = logdir
+    def check_args_maybe_append(self, args):
+        """
+        Compare current args (ExpSetup) against the saved hyper_parameters.json.
+
+        - Treat list/tuple as equivalent (JSON turns tuples into lists).
+        - Treat numpy scalars as Python scalars.
+        - For floats, allow tiny numerical differences.
+        - If a real mismatch is found, raise (so training truly stops).
+        - If new keys are present, renew the JSON file.
+        """
+        if self.args is None:
+            return None
+        validate_fft6_checkpoint(self.args, args)
+        enca_phase.validate_phase_checkpoint(self.args, args)
+
+        def _norm(v):
+            # JSON loads tuples as lists; treat them equivalently.
+            if isinstance(v, (list, tuple)):
+                return tuple(v)
+            # numpy scalars -> python scalars
+            try:
+                import numpy as _np
+                if isinstance(v, _np.generic):
+                    return v.item()
+            except Exception:
+                pass
+            return v
+
+        def _equal(a, b):
+            a = _norm(a)
+            b = _norm(b)
+
+            # float-ish comparisons with tolerance
+            if isinstance(a, float) or isinstance(b, float):
+                try:
+                    return abs(float(a) - float(b)) <= 1e-12
+                except Exception:
+                    return a == b
+
+            return a == b
+
+        save_args = False
+        mismatches = []
+
+        for k in dir(args):
+            if k.startswith("__"):
+                continue
+            if k in ("logdir", "max_training_steps"):
+                continue
+
+            if not hasattr(self.args, k):
+                # Fourier-CNN runs created before the window option used no
+                # window. Do not allow such a checkpoint to resume with Hann
+                # preprocessing merely because its JSON lacks the new key.
+                if k == "window":
+                    old_v = ""
+                    new_v = getattr(args, k)
+                    if not _equal(old_v, new_v):
+                        mismatches.append((k, old_v, new_v))
+                    else:
+                        print(
+                            'WARNING: key "window" was missing in the saved '
+                            'hyper-parameter configuration; treating it as the '
+                            'legacy empty value and renewing the file.'
+                        )
+                        save_args = True
+                    continue
+                print(f'WARNING: key "{k}" was missing in the saved hyper-parameter configuration; will renew file.')
+                save_args = True
+                continue
+
+            old_v = getattr(self.args, k)
+            new_v = getattr(args, k)
+
+            if not _equal(old_v, new_v):
+                mismatches.append((k, old_v, new_v))
+
+        if mismatches:
+            # Print all mismatches, then stop.
+            for k, old_v, new_v in mismatches:
+                print(f'ERROR! Mismatch in hyper-parameter settings file. Parameter {k} was {old_v}, now it is {new_v}.')
+            raise RuntimeError(
+                f"Hyper-parameter mismatch detected ({len(mismatches)} keys). "
+                "Either restore the old settings or start a new logdir."
+            )
+
+        if save_args:
+            self.save_parameters(args)
+
+        return None
+    def save_parameters(self, args):
+        d_args = {}
+        for attr in dir(args):
+            if not attr.startswith('__'):  # don't get methods
+                d_args[attr] = getattr(args, attr)
+        d = d_args
+        keys = d.keys()
+        k_drop = []
+        for k in keys:
+            try:
+                json.dumps(d[k])
+            except:
+                print('dropping key: %s' % k)
+                k_drop.append(k)
+        for k in k_drop:
+            d.pop(k, None)
+        with open(self.param_config_fn, 'w') as fh:
+            json.dump(d, fh, sort_keys=True, indent=4)
+        # Copy source file (remove this line if source filename changes.)
+        current_script_name = os.path.basename(__file__)
+        s_ = str(current_script_name).split('.')
+        script_basename = ''.join(s_[:-1]) # merge list of strings (in case multiple . exist in filename.)
+        script_extension_name = s_[-1]
+        src_file = os.path.join(os.getcwd(), current_script_name)
+        out_file = os.path.join(self.logdir, current_script_name)
+        if os.path.isfile(out_file): # if outfile already exists, save another copy.
+            date = datetime.datetime.now()
+            datestr = date.strftime('%Y%m%d')
+            out_file = os.path.join(self.logdir, script_basename+datestr+'.'+script_extension_name)
+            if os.path.isfile(out_file): #if there is already a copy from that day, add time details also.
+                datestr = date.strftime('%Y%m%d%H%M%S')
+                out_file = os.path.join(self.logdir, script_basename+datestr+'.'+script_extension_name)
+        shutil.copyfile(src_file, out_file)
+
+##################################################################################################
+class ExpSetup:
+    def __init__(self):
+        self.model = os.environ.get("MODEL", "original").strip().lower()
+        if self.model not in {"original", "jupiter"}:
+            raise ValueError(
+                f"Unknown SDDE model {self.model!r}; expected 'original' or 'jupiter'."
+            )
+
+        infer_phase = enca_phase.parse_infer_phase(os.environ.get("INFER_PHASE", "false"))
+        self.__dict__.update(enca_phase.phase_configuration(self.model, infer_phase))
+        tag = "fft6_cnn" + ("_phase" if self.infer_phase else "")
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_logdir = os.path.join(
+            os.getcwd(),
+            "sdde_ENCAFourier6CNN_runs",
+            f"{run_id}_{self.model}_{tag}"
+        )
+        self.logdir = os.environ.get("ENCA_FOURIER6_CNN_LOGDIR", default_logdir)
+
+        # Defaults: original=5, Jupiter=6, Jupiter with phase=8 (sin, cos).
+        # NDIMS_LATENT may add free summary coordinates beyond these targets.
+        self.ndims_latent = int(os.environ.get("NDIMS_LATENT", self.num_supervised_parameters))
+        self.num_noise_channels = 1
+        if self.ndims_latent < self.num_supervised_parameters:
+            raise ValueError(
+                f"ndims_latent={self.ndims_latent} cannot hold the "
+                f"{self.num_supervised_parameters} supervised coordinates for "
+                f"model={self.model!r}, infer_phase={self.infer_phase}."
+            )
+        self.decoder_activation = os.environ.get("DECODER_ACTIVATION", "leaky_relu").strip().lower()
+        if self.decoder_activation not in {"relu", "leaky_relu"}:
+            raise ValueError("DECODER_ACTIVATION must be relu or leaky_relu.")
+        self.num_fft_components = 100
+        # Fourier-CNN ENCA always uses the symmetric Hann preprocessing.
+        self.window = "Hann"
+        self.representation_mode = "enca_fft6_cnn"
+        self.encoder_fft_representation = "rfft_real_imag_ortho"
+        self.reconstruction_representation = "rfft_real_imag_ortho"
+        self.noise_fft_representation = "rfft_real_imag_ortho"
+        self.noise_window = ""  # Preserve the supplied noise; Hann is only for observations.
+        self.simulation_backend = (
+            src.generators.DataGenerator_SolarDynamo_SDDE_Canonical.simulation_backend
+        )
+
+        # SDDE sim settings
+        self.Twarmup = 200
+        self.Tobs = 271 # C14 dataset: 929, obsSN dataset: 271
+        self.dt = 0.1
+        self.saveat = 1.0
+        self.jupiter_period = 11.86
+
+        # derived length used by NN + dataset shapes
+        ratio = self.Tobs / self.saveat
+        if abs(ratio - round(ratio)) > 1e-9:
+            raise ValueError(f"Tobs ({self.Tobs}) must be divisible by saveat ({self.saveat}).")
+        self.len_timeseries = int(round(ratio))  # equals Tobs if saveat=1.0
+        max_rfft_components = self.len_timeseries // 2 + 1
+        if self.num_fft_components > max_rfft_components:
+            raise ValueError(
+                f"num_fft_components ({self.num_fft_components}) exceeds the rFFT size "
+                f"({max_rfft_components}) for len_timeseries={self.len_timeseries}."
+            )
+
+        self.batch_size = 300
+        self.max_training_steps = int(1.6e6)
+        self.freq_log = 500
+
+        # Loss setup
+        # "complex_nmse" divides each sample's complex squared error by its energy.
+        # "mse" retains the previous unnormalized reconstruction objective.
+        # The other modes are retained for explicit experiments.
+        # "balanced_mse" uses normalized MSEs with comparable reductions.
+        self.loss_mode = "complex_nmse"
+        self.lambda_recon = 1.0
+        self.lambda_reg = 1.0
+        self.recon_scale_eps = 1e-3
+
+        # Broad priors shared with train_MLP_model3.py for model comparison.
+        self.tau_lims = (0.1, 10.0)
+        self.T_lims = (0.1, 10.0)
+        self.Nd_lims = (1.0, 15.0)
+        # --------------------------------------------------------
+        # Ulzega et al. Apj 992, 2025: self.sigma_lims = (0.01, 0.3)
+        # Try something different:
+        self.sigma_lims = (0.005, 0.05)
+        # --------------------------------------------------------
+        self.Bmax_lims = (1.0, 15.0)
+        self.Aj_lims = (0.0, 0.1)
+        self.phi_lims = (0.0, 2.0 * np.pi)  # Uniform phase prior, radians (Jupiter).
+        self.__dict__.update(enca_phase.phase_configuration(
+            self.model, self.infer_phase, self.phi_lims
+        ))
+
+##################################################################################################
+def main():
+
+    args = ExpSetup()
+
+    if not os.path.isdir(args.logdir):
+        os.makedirs(args.logdir)
+
+    tf.keras.backend.clear_session()
+    physical_devices = tf.config.list_physical_devices('GPU')
+    for gpu_instance in physical_devices:
+        tf.config.experimental.set_memory_growth(gpu_instance, True)
+
+    ##################################################################################################
+    # Define a generator function for observations, parameters, and noise vectors
+    gen_train = src.generators.DataGenerator_SolarDynamo_SDDE_Canonical(
+        Tobs=args.Tobs,
+        saveat=args.saveat,
+        num_noise_channels=args.num_noise_channels,
+        Twarmup=args.Twarmup,
+        dt=args.dt,
+        # parameter priors
+        tau_lims=args.tau_lims,
+        T_lims=args.T_lims,
+        Nd_lims=args.Nd_lims,
+        sigma_lims=args.sigma_lims,
+        Bmax_lims=args.Bmax_lims,
+        Aj_lims=args.Aj_lims,
+        phi_lims=args.phi_lims,
+        model=args.model,
+        infer_phase=args.infer_phase,
+        jupiter_period=args.jupiter_period,
+    )
+
+    def next_batch_from_generator(gen, batch_size):
+        """Collect one batch, using the canonical threaded API when available."""
+        if hasattr(gen, "sample_batch"):
+            x_np, p_np, n_np = gen.sample_batch(batch_size)
+        else:
+            iterator = iter(gen)
+            samples = [next(iterator) for _ in range(batch_size)]
+            xs, ps, ns = zip(*samples)
+            x_np = np.stack(xs, axis=0).astype(np.float32)
+            p_np = np.stack(ps, axis=0).astype(np.float32)
+            n_np = np.stack(ns, axis=0).astype(np.float32)
+        if p_np.shape[1] != args.num_model_parameters:
+            raise ValueError(
+                f"Generator returned {p_np.shape[1]} parameters for "
+                f"model={args.model!r}; expected {args.num_model_parameters}."
+            )
+
+        # Convert to TF tensors
+        x_raw = tf.convert_to_tensor(x_np)
+        params = tf.convert_to_tensor(p_np)
+        noise = tf.convert_to_tensor(n_np)
+        x_encoder = timeseries_to_fourier_real_imag(
+            x_raw, args.num_fft_components, window=args.window
+        )
+        x = x_encoder  # Reconstruct exactly the 200 encoder inputs.
+        return x_encoder, x, params, noise
+
+    ##################################################################################################
+    # Define the architecture
+    model_obj = Architecture(
+        ndims_latent=args.ndims_latent,
+        len_timeseries=args.len_timeseries,
+        num_noise_channels=args.num_noise_channels,
+        num_fft_components=args.num_fft_components,
+        decoder_activation=args.decoder_activation,
+    )
+    model_obj.encoder.summary()
+    model_obj.decoder.summary()
+
+    ##################################################################################################
+    # Define objective functions
+    class ChiSquareStatistic(tf.keras.losses.Loss):
+        def call(self, y_true, y_pred):
+            '''Implements a chi-square-like sum of squared relative errors.'''
+            sd = tf.math.squared_difference(y_true, y_pred)
+            return tf.math.reduce_sum(sd / tf.math.maximum(tf.math.pow(y_true, 2), 1e-6), axis= -1)
+
+    param_width_values = [
+        args.tau_lims[1] - args.tau_lims[0],
+        args.T_lims[1] - args.T_lims[0],
+        args.Nd_lims[1] - args.Nd_lims[0],
+        args.sigma_lims[1] - args.sigma_lims[0],
+        args.Bmax_lims[1] - args.Bmax_lims[0],
+    ]
+    if args.model == "jupiter":
+        param_width_values.append(args.Aj_lims[1] - args.Aj_lims[0])
+    if len(param_width_values) != args.num_linear_parameters:
+        raise ValueError(
+            f"Configured {len(param_width_values)} parameter widths, expected "
+            f"{args.num_linear_parameters} non-circular parameters for model={args.model!r}."
+        )
+    param_widths = tf.constant(param_width_values, dtype=tf.float32)
+    parameter_names = args.parameter_names
+
+    @tf.function
+    def loss_reconstruction_fn_legacy(x, x_pred, return_each_dim=False):
+        if return_each_dim:
+            d = {}
+            for i in range(x.shape[-1]): # do over all channels of observation (it's just 1 in our example.)
+                # d['MSE_x_ch_%d'%(i+1)] = tf.keras.losses.MeanSquaredError(name='MSE')(x[...,i],x_pred[...,i]) # default behavior is sum over batch size: (average over minibatch size)
+                d['ChiSquare_x_ch_%d'%(i+1)] = ChiSquareStatistic(name='ChiSquare')(y_true=x[...,i], y_pred=x_pred[...,i]) / args.num_fft_components
+            return d
+        else:
+            # return tf.keras.losses.MeanSquaredError(name='MSE')(x,x_pred)
+            return ChiSquareStatistic(name='ChiSquare')(x,x_pred) / args.num_fft_components
+
+    @tf.function
+    def loss_regress_params_fn_legacy(params, params_pred, return_each_dim=False):
+        # Retain legacy relative errors for scalar parameters, but always use
+        # a bounded-scale MSE for sin/cos (relative errors fail near zero).
+        infer_phase = getattr(args, "infer_phase", False)
+        num_physical = params.shape[-1]
+        num_linear = num_physical - int(infer_phase)
+        d = {}
+        for i in range(num_linear):
+            d[f'ChiSquare_z_{i+1}'] = ChiSquareStatistic(name=f'ChiSquare_z_{i+1}')(
+                params[..., i], params_pred[..., i]
+            ) / num_physical
+        if infer_phase:
+            d['NormMSE_phi'] = enca_phase.phase_pair_mse(params, params_pred) / num_physical
+        return d if return_each_dim else tf.reduce_sum(list(d.values()))
+
+    @tf.function
+    def loss_reconstruction_fn_balanced(x, x_pred, return_each_dim=False):
+        """
+        Per-sample normalized MSE:
+          1. compute one RMS amplitude scale per sample and channel
+          2. normalize reconstruction error by that scale
+          3. average over time, then over batch
+        """
+        rms_scale = tf.sqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True))
+        rms_scale = tf.maximum(rms_scale, tf.constant(args.recon_scale_eps, dtype=x.dtype))
+        sq_error = tf.square((x - x_pred) / rms_scale)
+        per_sample_channel = tf.reduce_mean(sq_error, axis=1)  # [batch, channels]
+
+        if return_each_dim:
+            d = {}
+            for i in range(x.shape[-1]):
+                d[f'NormMSE_x_ch_{i+1}'] = tf.reduce_mean(per_sample_channel[:, i])
+            return d
+
+        return tf.reduce_mean(per_sample_channel)
+
+    @tf.function
+    def loss_reconstruction_fn_complex_normalized(x, x_pred, return_each_dim=False):
+        """Per-sample complex error / target energy, then average over batch.
+
+        One shared mean-square scale across frequency AND Re/Im preserves
+        their relative weighting. recon_scale_eps is an RMS floor (squared
+        here); a zero prediction has loss 1 whenever the floor is inactive.
+        Per-channel diagnostics average to the total reconstruction loss.
+        """
+        mean_square = tf.reduce_mean(tf.square(x), axis=[1, 2], keepdims=True)
+        denominator = tf.maximum(mean_square, tf.cast(args.recon_scale_eps ** 2, x.dtype))
+        normalized_error = tf.square(x - x_pred) / denominator
+        per_channel = tf.reduce_mean(normalized_error, axis=[0, 1])
+        if return_each_dim:
+            return {f'ComplexNormMSE_x_ch_{i+1}': per_channel[i] for i in range(2)}
+        return tf.reduce_mean(per_channel)
+
+    @tf.function
+    def loss_regress_params_fn_balanced(params, params_pred, return_each_dim=False):
+        """Prior-range MSE; sin/cos together count as one physical parameter."""
+        infer_phase = getattr(args, "infer_phase", False)
+        num_linear = params.shape[-1] - int(infer_phase)
+        widths = tf.cast(param_widths[:num_linear], params.dtype)
+        sq_error = tf.square((params[..., :num_linear] - params_pred[..., :num_linear]) / widths)
+        d = {f'NormMSE_z_{i+1}': tf.reduce_mean(sq_error[:, i]) for i in range(num_linear)}
+        if infer_phase:
+            d['NormMSE_phi'] = enca_phase.phase_pair_mse(params, params_pred)
+        return d if return_each_dim else tf.reduce_mean(tf.stack(list(d.values())))
+    # Define additional metrics for logging at every
+
+    ##################################################################################################
+    # Define optimizer
+    # --- Custom LR schedule: linear warmup from ~0 to your initial LR, then exponential decay ---
+    # lr_schedule = src.utils_tf.LearningRateScheduleExponentialDecayWithLinearWarmup(steps_warmup=args.linear_warmup_steps, initial_learning_rate=1.e-3, decay_steps=int(18e3), decay_rate=0.92, staircase=True)
+    # --- Exponential decay with fixed initial LR ---
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1.e-3,
+        decay_steps=int(18e3),
+        decay_rate=0.92,
+        staircase=True,
+    )
+    # --- Optimizer ---
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    #, clipnorm=1e5, clipvalue=1.)
+    # #clips |gradients| above clipvalue to prevent exploding.,
+    # #clipnorm: preventative measure for divergence.
+    # Unfortunately both are clipping individually for each gradient, which can change the direction of the gradients..
+    global_gradient_clipnorm = 1e5
+
+    ##################################################################################################
+    # Define ckpt managers to save model weights throughout optimization
+    ckpt = tf.train.Checkpoint(optimizer=optimizer, encoder=model_obj.encoder, decoder=model_obj.decoder)
+    save_manager = tf.train.CheckpointManager(checkpoint=ckpt, directory=args.logdir, max_to_keep=3, checkpoint_name='model_ckpt')
+    save_manager_best = tf.train.CheckpointManager(checkpoint=ckpt, directory=args.logdir, max_to_keep=3, checkpoint_name='model_best_ckpt') # manager for early stopping.
+    save = lambda save_manager, ckpt_number=None: save_manager.save(checkpoint_number=ckpt_number)
+    # Define a manager object for training hyper-parameters
+    hp_manager = Manage_Hyper_Parameters(logdir=args.logdir)
+
+    ##################################################################################################
+    # Restore a previously interrupted training session (if exists)
+    if save_manager.latest_checkpoint:
+        validate_fft6_checkpoint(hp_manager.args, args)
+        saved_model = (
+            getattr(hp_manager.args, "model", None)
+            if hp_manager.args is not None
+            else None
+        )
+        saved_backend = (
+            getattr(hp_manager.args, "simulation_backend", None)
+            if hp_manager.args is not None
+            else None
+        )
+        if saved_model != args.model or saved_backend != args.simulation_backend:
+            raise RuntimeError(
+                "Refusing to resume this ENCAfft6CNN checkpoint because it "
+                "predates or does not use the canonical explicit-noise SDDE "
+                "contract for the selected model. Start in a new "
+                "ENCA_FOURIER6_CNN_LOGDIR."
+            )
+        hp_manager.check_args_maybe_append(args)
+        ckpt.restore(save_manager.latest_checkpoint)
+        print(f"Restored from {save_manager.latest_checkpoint}.")
+    else:
+        print("Initializing training from scratch. \nLogdir: %s" % args.logdir)
+        # Dump hyper-parameters to ckpt dir for future reference.
+        hp_manager.save_parameters(args)
+
+    ##################################################################################################
+    # Setup summaries for tensorboard
+    summary_writer = tf.summary.create_file_writer(logdir=os.path.join(args.logdir, 'train'))
+
+    def export_summary_scalars(dict_name_and_val, step, writer):
+        if not isinstance(dict_name_and_val, dict):
+            raise AssertionError('dict_name_and_val must be a dictionary.')
+        with writer.as_default():
+            for k, v in dict_name_and_val.items():
+                tf.summary.scalar(k, v, step=step)
+
+    def export_summary_histograms(dict_name_and_val, step, writer):
+        if not isinstance(dict_name_and_val, dict):
+            raise AssertionError('dict_name_and_val must be a dictionary.')
+        with writer.as_default():
+            for k, v in dict_name_and_val.items():
+                tf.summary.histogram(k, v, step=step)
+
+    ##################################################################################################
+    # wrap a training step for performance gains.
+    @tf.function
+    def train_step(model, x_encoder, x, params, noise, optimizer):
+        """Reconstruct the encoder Re/Im inputs and supervise leading latent coordinates."""
+        with tf.GradientTape(persistent=False) as tape:
+            z_latent = model.encoder(x_encoder, training=True)
+            x_reconst = model.decoder((z_latent, noise), training=True)
+
+            if args.loss_mode == "complex_nmse":
+                dict_reconstruction = loss_reconstruction_fn_complex_normalized(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            elif args.loss_mode == "mse":
+                dict_reconstruction = {
+                    f'MSE_x_ch_{i+1}': tf.reduce_mean(tf.square(x[..., i] - x_reconst[..., i]))
+                    for i in range(2)
+                }
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            elif args.loss_mode == "legacy_chisq":
+                dict_reconstruction = loss_reconstruction_fn_legacy(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_sum(list(dict_reconstruction.values()))
+
+                dict_regression = loss_regress_params_fn_legacy(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_sum(list(dict_regression.values()))
+            elif args.loss_mode == "balanced_mse":
+                dict_reconstruction = loss_reconstruction_fn_balanced(x, x_reconst, return_each_dim=True)
+                loss_reconstruction = tf.reduce_mean(tf.stack(list(dict_reconstruction.values())))
+
+                dict_regression = loss_regress_params_fn_balanced(params, z_latent, return_each_dim=True)
+                loss_regress_params = tf.reduce_mean(tf.stack(list(dict_regression.values())))
+            else:
+                raise ValueError(f"Unknown loss_mode: {args.loss_mode}")
+
+            loss = args.lambda_recon * loss_reconstruction + args.lambda_reg * loss_regress_params
+
+        trainable_variables = model.encoder.trainable_variables + model.decoder.trainable_variables
+        gradients = tape.gradient(loss, trainable_variables)
+
+        if global_gradient_clipnorm is not None:
+            gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=global_gradient_clipnorm)
+
+        optimizer.apply_gradients(zip(gradients, trainable_variables))
+
+        return (loss_reconstruction, loss_regress_params, loss), (z_latent, x_reconst), (dict_reconstruction, dict_regression)
+    ##################################################################################################
+    # Define a few metrics to export to tensorboard
+    avg_loss_total = tf.keras.metrics.Mean(name='loss_total', dtype=tf.float32) # variable will keep track of average of loss value since last freq_log
+    avg_loss_recon = tf.keras.metrics.Mean(name='loss_reconstruction', dtype=tf.float32)
+    avg_loss_reg_p = tf.keras.metrics.Mean(name='loss_regress_params', dtype=tf.float32)
+    dict_avg_loss_recon_items = {} #will create mean metric on the fly since we don't know names in advance.
+    dict_avg_loss_reg_p_items = {}
+    dict_avg_rmse_recon_items = {}
+    dict_avg_rmse_reg_p_items = {}
+    avg_phase_mse = tf.keras.metrics.Mean(name='phase_wrapped_mse')
+    avg_phase_norm = tf.keras.metrics.Mean(name='phase_vector_norm')
+
+    ##################################################################################################
+    # Define a metric to keep track of best reconstruction over a longer window
+    avg_loss_long_term = tf.keras.metrics.Mean(name='loss_long_term', dtype=tf.float32)
+    curr_best_loss = np.inf
+
+    ##################################################################################################
+    # Execute training loop
+    step = 0  # will survive after loop
+    last_step_saved = False
+
+    print("Building first batch...")
+    t0 = time.time()
+    x_encoder, x, params, noise = next_batch_from_generator(gen_train, args.batch_size)
+    print(f"First batch built in {time.time()-t0:.1f}s: encoder={x_encoder.shape}, target={x.shape}, params={params.shape}, noise={noise.shape}")
+
+    # --- quick finiteness + stats checks (on first batch) ---
+    def assert_finite(name, t):
+        t_np = t.numpy()
+        if not np.isfinite(t_np).all():
+            bad = np.where(~np.isfinite(t_np))
+            raise ValueError(f"{name} has non-finite values at {bad[:3]}")
+
+    assert_finite("x_encoder", x_encoder)
+    assert_finite("x_target", x)
+    assert_finite("params", params)
+    assert_finite("noise", noise)
+    print("Batch finiteness: OK")
+
+    print("encoder Re/Im stats:", float(tf.reduce_min(x_encoder)), float(tf.reduce_max(x_encoder)), float(tf.reduce_mean(x_encoder)))
+    print("target Re/Im stats:", float(tf.reduce_min(x)), float(tf.reduce_max(x)), float(tf.reduce_mean(x)))
+    print("params stats:", float(tf.reduce_min(params)), float(tf.reduce_max(params)), float(tf.reduce_mean(params)))
+    print("noise stats:", float(tf.reduce_min(noise)), float(tf.reduce_max(noise)), float(tf.reduce_mean(noise)))
+    print(f"SDDE model: {args.model} (parameters: {', '.join(parameter_names)})")
+    print(f"infer_phase={args.infer_phase}; supervised targets: {', '.join(args.supervised_names)}")
+    print(f"simulation backend: {args.simulation_backend}")
+    print(f"Decoder activation: {args.decoder_activation}")
+    print(f"FFT window: {args.window or 'none (legacy)'}")
+    print(f"loss mode: {args.loss_mode} (lambda_recon={args.lambda_recon}, lambda_reg={args.lambda_reg})")
+
+    # --- warm up tf.function tracing/compilation ---
+    print("Warming up train_step (tf.function tracing/compilation)...")
+    t1 = time.time()
+    _ = train_step(model=model_obj, x_encoder=x_encoder, x=x, params=params, noise=noise, optimizer=optimizer)
+    print(f"Warmup train_step done in {time.time()-t1:.2f}s")
+
+    # ---------------------------------------------------------
+    # Main training loop
+    # ---------------------------------------------------------
+    while True:
+        # 1) build batch (python)
+        x_encoder, x, params, noise = next_batch_from_generator(gen_train, args.batch_size)
+
+        # 2) train step (tf.function)
+        loss_tuple, z_and_x, dict_mse = train_step(
+            model=model_obj, x_encoder=x_encoder, x=x, params=params, noise=noise, optimizer=optimizer
+        )
+
+        # unpack
+        z_latent, x_reconst = z_and_x
+        loss_reconstruction, loss_regress_params, loss_total = loss_tuple
+        dict_rec, dict_reg = dict_mse
+
+        # 3) NaN/Inf guard
+        tf.debugging.assert_all_finite(loss_total, "loss_total has NaN or Inf")
+
+        # 4) step / stopping
+        step = int(optimizer.iterations.numpy())
+        reached_max_steps = step >= args.max_training_steps
+
+        # 5) metrics + logging + checkpoints
+
+        # Update metrics (your existing code continues...)
+        avg_loss_recon.update_state(loss_reconstruction)
+        avg_loss_reg_p.update_state(loss_regress_params)
+        avg_loss_total.update_state(loss_total)
+        avg_loss_long_term.update_state(loss_total)
+
+        # Per-channel reconstruction losses
+        for k in dict_rec:
+            if k not in dict_avg_loss_recon_items:
+                dict_avg_loss_recon_items[k] = tf.keras.metrics.Mean(name=k, dtype=tf.float32)
+            dict_avg_loss_recon_items[k].update_state(dict_rec[k])
+
+        # Per-parameter regression losses
+        for k in dict_reg:
+            if k not in dict_avg_loss_reg_p_items:
+                dict_avg_loss_reg_p_items[k] = tf.keras.metrics.Mean(name=k, dtype=tf.float32)
+            dict_avg_loss_reg_p_items[k].update_state(dict_reg[k])
+
+        # RMSE reconstruction
+        for i_ in range(x.shape[-1]):
+            k = f'RMSE_x_ch_{i_+1}'
+            if k not in dict_avg_rmse_recon_items:
+                dict_avg_rmse_recon_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                    name='rmse_reconstruction', dtype=tf.float32
+                )
+            dict_avg_rmse_recon_items[k].update_state(
+                y_true=x[..., i_], y_pred=x_reconst[..., i_]
+            )
+
+        # RMSE of supervised coordinates (physical phi is never compared to sin(phi)).
+        regression_targets = enca_phase.supervised_targets(params, args.infer_phase)
+        for i_ in range(regression_targets.shape[-1]):
+            k = f'RMSE_z_ch_{i_+1}'
+            if k not in dict_avg_rmse_reg_p_items:
+                dict_avg_rmse_reg_p_items[k] = tf.keras.metrics.RootMeanSquaredError(
+                    name='rmse_regularization', dtype=tf.float32
+                )
+            dict_avg_rmse_reg_p_items[k].update_state(
+                y_true=regression_targets[..., i_], y_pred=z_latent[..., i_]
+            )
+
+        if args.infer_phase:
+            avg_phase_mse.update_state(tf.square(enca_phase.wrapped_phase_error(params, z_latent)))
+            avg_phase_norm.update_state(tf.norm(z_latent[..., 6:8], axis=-1))
+
+        # ------------------------------------------------
+        # Logging block
+        # ------------------------------------------------
+        if (step % args.freq_log == 0) or reached_max_steps:
+
+            d_scalars = {
+                'loss_total': avg_loss_total.result(),
+                'loss_reconstruction': avg_loss_recon.result(),
+                'loss_regress_params': avg_loss_reg_p.result(),
+                'loss_weight/lambda_recon': tf.constant(args.lambda_recon, dtype=tf.float32),
+                'loss_weight/lambda_reg': tf.constant(args.lambda_reg, dtype=tf.float32),
+            }
+
+            if args.infer_phase:
+                d_scalars['phase/circular_rmse_rad'] = tf.sqrt(avg_phase_mse.result())
+                d_scalars['phase/mean_predicted_vector_norm'] = avg_phase_norm.result()
+                avg_phase_mse.reset_state()
+                avg_phase_norm.reset_state()
+
+            # --- Parameter ranges in current batch ---
+            # (safe even with batch_size=1; then min==max)
+            p = params.numpy()   # Physical theta: 5, 6, or 7 columns.
+
+            tau_min, tau_max     = float(p[:,0].min()), float(p[:,0].max())
+            T_min, T_max         = float(p[:,1].min()), float(p[:,1].max())
+            Nd_min, Nd_max       = float(p[:,2].min()), float(p[:,2].max())
+            sigma_min, sigma_max = float(p[:,3].min()), float(p[:,3].max())
+            Bmax_min, Bmax_max   = float(p[:,4].min()), float(p[:,4].max())
+
+            logging.info(
+                "params ranges: "
+                f"tau[{tau_min:.3f},{tau_max:.3f}] "
+                f"T[{T_min:.3f},{T_max:.3f}] "
+                f"Nd[{Nd_min:.3f},{Nd_max:.3f}] "
+                f"sigma[{sigma_min:.3f},{sigma_max:.3f}] "
+                f"Bmax[{Bmax_min:.3f},{Bmax_max:.3f}]"
+            )
+
+            # Optional: also push ranges to TensorBoard
+            d_scalars.update({
+                "theta/tau_min": tau_min, "theta/tau_max": tau_max,
+                "theta/T_min": T_min, "theta/T_max": T_max,
+                "theta/Nd_min": Nd_min, "theta/Nd_max": Nd_max,
+                "theta/sigma_min": sigma_min, "theta/sigma_max": sigma_max,
+                "theta/Bmax_min": Bmax_min, "theta/Bmax_max": Bmax_max,
+            })
+
+            for i_ in range(5, args.num_model_parameters):
+                d_scalars[f'theta/{parameter_names[i_]}_min'] = float(p[:, i_].min())
+                d_scalars[f'theta/{parameter_names[i_]}_max'] = float(p[:, i_].max())
+
+            for k in dict_avg_loss_recon_items:
+                d_scalars[k] = dict_avg_loss_recon_items[k].result()
+                dict_avg_loss_recon_items[k].reset_state()
+
+            for k in dict_avg_loss_reg_p_items:
+                d_scalars[k] = dict_avg_loss_reg_p_items[k].result()
+                dict_avg_loss_reg_p_items[k].reset_state()
+
+            for k in dict_avg_rmse_recon_items:
+                d_scalars[k] = dict_avg_rmse_recon_items[k].result()
+                dict_avg_rmse_recon_items[k].reset_state()
+
+            for k in dict_avg_rmse_reg_p_items:
+                d_scalars[k] = dict_avg_rmse_reg_p_items[k].result()
+                dict_avg_rmse_reg_p_items[k].reset_state()
+
+            d_scalars['lr_schedule'] = lr_schedule(step=step)
+
+            export_summary_scalars(d_scalars, step=step, writer=summary_writer)
+
+            logging.info(
+                'Step %d: avg loss: %.3f, reconstruction loss: %.3f, parameter regression loss: %.3f.'
+                % (step,
+                float(d_scalars['loss_total']),
+                float(d_scalars['loss_reconstruction']),
+                float(d_scalars['loss_regress_params']))
+            )
+
+            avg_loss_total.reset_state()
+            avg_loss_recon.reset_state()
+            avg_loss_reg_p.reset_state()
+
+            d_histograms = dict(
+                [(f"enc_{v.name}", tf.identity(v)) for v in model_obj.encoder.trainable_variables] +
+                [(f"dec_{v.name}", tf.identity(v)) for v in model_obj.decoder.trainable_variables]
+            )
+            export_summary_histograms(d_histograms, step=step, writer=summary_writer)
+
+            save(save_manager, ckpt_number=step)
+            last_step_saved = True
+
+        # ------------------------------------------------
+        # Long-term best model check
+        # ------------------------------------------------
+        if (step % (10 * args.freq_log) == 0) or reached_max_steps:
+
+            current_long_loss = float(avg_loss_long_term.result().numpy())
+            # Compare independent fixed-length windows. Reset even when the
+            # current window is not a new best so a transient spike cannot
+            # contaminate every subsequent best-checkpoint comparison.
+            avg_loss_long_term.reset_state()
+
+            if current_long_loss < curr_best_loss:
+                curr_best_loss = current_long_loss
+
+                logging.info(
+                    'New long term best loss found: %.3f. Saving.' % curr_best_loss
+                )
+
+                save(save_manager_best, ckpt_number=step)
+
+        if reached_max_steps:
+            logging.info("Training is completed.")
+            break
+
+
+    # ------------------------------------------------
+    # Final save after exiting loop
+    # ------------------------------------------------
+    if not last_step_saved:
+        save(save_manager, ckpt_number=step)
+
+class Sampler:
+    '''Class provides user friendly access to low-dimensional space for summary statistics analysis.'''
+    def __init__(self, generator=None, iterator=None, **kwargs):
+        '''Constructor builds NN model and loads its weights. In addition, a generator with true sun parameters is initialized.'''
+        # An explicit checkpoint is authoritative, independent of shell settings.
+        logdir = kwargs['logdir'] if 'logdir' in kwargs else ExpSetup().logdir
+        self.basename = kwargs.get('basename', 'model_best_ckpt')
+        if not os.path.isdir(logdir):
+            raise AssertionError(f'logdir {logdir} is not found.')
+        hp_manager = Manage_Hyper_Parameters(logdir=logdir)
+        if hp_manager.args is None:
+            raise AssertionError(f'Hyper-parameter configuration {hp_manager.param_config_fn} is not found.')
+        validate_fft6_checkpoint(hp_manager.args)
+        phase_config = enca_phase.validate_phase_checkpoint(hp_manager.args)
+        self.args = hp_manager.args
+        self.args.logdir = logdir
+        self.args.__dict__.update(phase_config)
+        self.args.window = validate_window(getattr(self.args, 'window', ''))
+        self.args.model = getattr(self.args, 'model', 'original')
+        self.args.Aj_lims = getattr(self.args, 'Aj_lims', [0.0, 0.1])
+        self.args.phi_lims = getattr(self.args, 'phi_lims', self.args.phase_prior or [0.0, 2.0 * np.pi])
+        self.args.jupiter_period = float(getattr(self.args, 'jupiter_period', 11.86))
+        self.prng = kwargs.get('prng', np.random.RandomState(1999))
+        self.model_obj = None
+        self.build_model()
+        self.load_model(basename=self.basename)
+        self.generator = generator
+        self.iterator = iterator
+
+    def sample(self, num_samples=10, return_noise_vectors=False, params=None):
+        '''Function samples #num_samples observed vectors, then returns the mapped representation for each (size: [#num_samples, #stats]).
+        if params is not None, existing generator is ignored and a new custom one is initialized.'''
+        if params is None: # if none, fallback to default generator of the class instance
+            if self.iterator is None:
+                raise AssertionError('iterator is not defined. You must provide a parameter dict for the generator.')
+            iterator = self.iterator
+        else:
+            _, iterator = self.build_custom_generator(return_generator=True, **params)
+
+        summary_space = np.zeros((num_samples, self.args.ndims_latent))
+        ndarray_noise_timeseries = np.zeros((num_samples, self.args.len_timeseries, self.args.num_noise_channels))
+        for i in range(num_samples):
+            b = next(iterator) # sample contains a tuple of form (x, params, noise)
+            x_i = np.expand_dims(b[0], axis=0).astype(np.float32)
+            x_i = timeseries_to_fourier_real_imag(
+                x_i, self.args.num_fft_components, window=self.args.window
+            )
+            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
+            o_latent = self.model_obj.encoder(x_i, training=False).numpy()
+            summary_space[i,...] = o_latent
+            ndarray_noise_timeseries[i,...] = noise_i
+        if return_noise_vectors:
+            return summary_space, ndarray_noise_timeseries
+        else:
+            return summary_space
+
+    def encode(self, samples):
+        '''Encode raw samples shaped [num_samples, len_timeseries, 1].'''
+        samples_fourier = timeseries_to_fourier_real_imag(
+            samples, self.args.num_fft_components, window=self.args.window
+        )
+        o_latent = self.model_obj.encoder(samples_fourier)
+        return o_latent
+
+    def reconstruct(self, num_samples=10, params=None):
+        '''Return Re/Im spectra with shape [num_samples, num_fft_components, 2].'''
+        if params is None: # if none, fallback to default generator of the class instance
+            if self.iterator is None:
+                raise AssertionError('iterator is not defined. You must provide a parameter dict for the generator.')
+            iterator = self.iterator
+        else:
+            _, iterator = self.build_custom_generator(return_generator=True, **params)
+        ndarray_timeseries = np.zeros((num_samples, self.args.num_fft_components, 2))
+        for i in range(num_samples):
+            b = next(iterator) # sample contains a tuple of form (x, params, noise)
+            x_i = np.expand_dims(b[0], axis=0).astype(np.float32)
+            x_i = timeseries_to_fourier_real_imag(
+                x_i, self.args.num_fft_components, window=self.args.window
+            )
+            noise_i = np.expand_dims(b[2], axis=0).astype(np.float32) #creating minibatch size 1.
+            z_latent = self.model_obj.encoder(x_i, training=False)
+            o_reconst = self.decode((z_latent, noise_i))
+            ndarray_timeseries[i,...] = np.squeeze(o_reconst)
+        return ndarray_timeseries
+
+    def decode(self, tuple_summary_and_noise):
+        '''Reconstruct from (latent, raw noise); the decoder computes complex rFFT Re/Im pairs internally.'''
+        o_latent = tf.convert_to_tensor(tuple_summary_and_noise[0], dtype=tf.float32)
+        noise_i = tf.convert_to_tensor(tuple_summary_and_noise[1], dtype=tf.float32)
+        o_reconst = self.model_obj.decoder((o_latent, noise_i), training=False).numpy()
+        return o_reconst
+
+    def check_hyper_params(self):
+        hp_manager = Manage_Hyper_Parameters(logdir=self.args.logdir)
+        if hp_manager.args is None:
+            raise AssertionError('Hyper-parameter configuration file %s is not found. Quitting.' % (hp_manager.param_config_fn))
+        else:
+            for attr in dir(self.args):
+                if not attr.startswith('__') and attr not in ['logdir', 'batch_size']:  # don't get methods, ignore logdir and batch_size, as the optimization could have been done elsewhere.
+                    if not hasattr(hp_manager.args, attr):
+                        continue
+                    if getattr(self.args, attr) != getattr(hp_manager.args, attr):
+                        raise AssertionError('Mismatch of hyper-parameter attributes in the logdir %s and ExpSetup file in this script for attribute: %s' % (self.args.logdir, attr))
+
+    def build_model(self):
+        self.model_obj = Architecture(
+            ndims_latent=self.args.ndims_latent,
+            len_timeseries=self.args.len_timeseries,
+            num_noise_channels=self.args.num_noise_channels,
+            num_fft_components=self.args.num_fft_components,
+            decoder_activation=getattr(self.args, "decoder_activation", "relu"),
+        )
+
+    def load_model(self, basename='model_best_ckpt'):
+        ckpt = tf.train.Checkpoint(encoder=self.model_obj.encoder, decoder=self.model_obj.decoder)
+        save_manager = tf.train.CheckpointManager(checkpoint=ckpt, directory=self.args.logdir, max_to_keep=3, checkpoint_name=basename)
+        # Restore model weights
+        ckptname = get_ckptname(logdir=self.args.logdir, id=basename)
+        try:
+            ckpt.restore(ckptname).assert_existing_objects_matched().expect_partial()
+        except:
+            raise AssertionError('Model weights with basename %s not found in logdir %s. Quitting.' % (basename, self.args.logdir))
+        print('Model weights loaded from %s.' % ckptname)
+
+    def build_custom_generator(self, return_generator=False, *, prng=None):
+        if prng is None:
+            prng = self.prng
+
+        generator = src.generators.DataGenerator_SolarDynamo_SDDE_Canonical(
+            prng=prng,
+            Tobs=self.args.Tobs,
+            saveat=self.args.saveat,
+            num_noise_channels=self.args.num_noise_channels,
+            Twarmup=self.args.Twarmup,
+            dt=self.args.dt,
+            tau_lims=self.args.tau_lims,
+            T_lims=self.args.T_lims,
+            Nd_lims=self.args.Nd_lims,
+            sigma_lims=self.args.sigma_lims,
+            Bmax_lims=self.args.Bmax_lims,
+            Aj_lims=self.args.Aj_lims,
+            phi_lims=self.args.phi_lims,
+            model=self.args.model,
+            infer_phase=self.args.infer_phase,
+            jupiter_period=self.args.jupiter_period,
+        )
+
+        iterator = generator.__iter__()
+        if return_generator:
+            return generator, iterator
+        else:
+            self.generator = generator
+            self.iterator = iterator
+
+def get_ckptname(logdir, id):
+    fl = glob.glob(os.path.join(logdir, '*')) # full paths of all files
+    fn = [it for it in fl if id in os.path.basename(it)] #keep only files that match id in the basenames
+    flb = [os.path.basename(it) for it in fn] #keep only basenames of matching abs path filenames
+    ind = np.argmax([int(it[len(id)+1:].split('.')[0]) for it in flb]) #get highest ckpt ind of matching filenames
+    fname = fn[ind] #get abs filename of the matching index file
+    fname = '.'.join(fname.split('.')[:-1]) # truncate extension of the file: e.g., /path/to/file/{id}-{ind}.{extension} -> /path/to/file/{id}-{ind}
+    return fname
+
+if __name__ == "__main__":
+    gpus = tf.config.list_physical_devices("GPU")
+    print("GPUs visible to TensorFlow:", gpus)
+    main()

@@ -15,6 +15,7 @@ The repository contains the code needed to train the proposed models _explicit n
 - `train_ENCAFourierCNN_model3.py`: Fourier-space SDDE ENCA with a noise-conditioned CNN decoder
 - `train_ENCAfft2CNN_model3.py`: log-amplitude encoder with real/imaginary noise FFT conditioning
 - `train_ENCAfft4CNN_model3.py`: real/imaginary FFT autoencoder conditioned on noise amplitudes
+- `train_ENCAfft6CNN_model3.py`: real/imaginary FFT autoencoder conditioned on complex noise coefficients
 - `train_MLP_model3.py`: solar-dynamo / SDDE MLP experiments on Fourier-amplitude representations
 - `train_FNO_model3.py`: solar-dynamo / SDDE FNO experiments with configurable time- or Fourier-domain reconstruction loss
 
@@ -354,6 +355,40 @@ MODEL=original ENCA_FOURIER4_CNN_LOGDIR=sdde_ENCAFourier4CNN_runs/my_new_run \
 # On the GPU cluster:
 sbatch runtraining_gpu_encafourier4cnn.sh
 ```
+
+### ENCAfft6CNN
+
+`train_ENCAfft6CNN_model3.py` is the complex-noise counterpart of FFT4. The
+encoder, observation preprocessing, reconstruction target, complex NMSE,
+parameter regression, priors, and training defaults are unchanged. The sole
+architecture change is the decoder noise branch: it uses the first 100
+unwindowed noise rFFT coefficients divided by sqrt(N), as Re/Im pairs rather
+than magnitudes. For one noise channel, the decoder CNN receives three channels
+per frequency: the latent projection, noise Re, and noise Im. Its signed output
+still reconstructs the noisy observation's Hann-windowed complex spectrum.
+
+The supplied noise is still the simulator generator's subsampled post-warmup
+sequence; this change does not provide the complete driving noise trajectory.
+Both encoder and decoder hidden activations default to LeakyReLU (slope 0.1).
+The trainer sets `JULIA_NUM_GC_THREADS=1` before initializing Julia.
+
+Runs use a separate `sdde_ENCAFourier6CNN_runs/` root and the override
+`ENCA_FOURIER6_CNN_LOGDIR`. `NDIMS_LATENT` selects the latent dimension as in
+FFT4. Checkpoint metadata identifies `enca_fft6_cnn` with noise representation
+`rfft_real_imag_ortho`; FFT4 checkpoints are rejected. Train from scratch in a
+fresh directory. For example (this starts training):
+
+```bash
+MODEL=original NDIMS_LATENT=7 \
+  ENCA_FOURIER6_CNN_LOGDIR=sdde_ENCAFourier6CNN_runs/20261026_encafourier6cnn_z7 \
+  python3 train_ENCAfft6CNN_model3.py
+```
+
+`runtraining_gpu_encafourier6cnn.sh` mirrors the FFT4 launcher with FFT6 job,
+trainer and output-directory references. Edit `NDIMS_LATENT` there, then submit
+with `sbatch runtraining_gpu_encafourier6cnn.sh`. The FFT4 launcher is unchanged.
+The trainer includes a `Sampler` for encoding and reconstruction; FFT4 diagnostic
+scripts and inference CLI selectors do not yet accept FFT6 checkpoints.
 
 ### Optional Jupiter phase supervision (ENCAfft2CNN and ENCAfft4CNN)
 

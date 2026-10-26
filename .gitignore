@@ -346,3 +346,6 @@ tags
 .renku/cache
 
 sdde_MLPwithNoise_runs/
+
+# ENCAfft6CNN training outputs
+sdde_ENCAFourier6CNN_runs/
